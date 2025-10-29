@@ -85,19 +85,9 @@ def health():
 async def start_background_task():
     async def periodic_task():
         while True:
-            await asyncio.sleep(0.5)  # half a second
+            await asyncio.sleep(0.5)
             if latest:
-                # Do something with latest packet
                 print(f"[0.5s Task] Latest packet: {latest.dict()}")
-                # If needed, push to WebSocket clients
-                disconnected = []
-                for ws in connected_clients:
-                    try:
-                        await ws.send_json(latest.dict())
-                    except Exception:
-                        disconnected.append(ws)
-                for ws in disconnected:
-                    connected_clients.remove(ws)
     asyncio.create_task(periodic_task())
 
 # -------------------------------
