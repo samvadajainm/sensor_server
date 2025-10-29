@@ -1,12 +1,12 @@
 # sensor_server.py
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Deque, Optional, List
 from collections import deque
 import time
-import uvicorn
 import asyncio
+import uvicorn
 
 app = FastAPI(title="High-Frequency Sensor Server")
 
@@ -23,13 +23,16 @@ class VitalPacket(BaseModel):
     spo2_pct: float
 
 # -------------------------------
-# Rolling buffer and WebSocket clients
+# Rolling buffer
 # -------------------------------
-N_BUFFER = 10_000  # store ~100 packets/sec for 100 seconds
+N_BUFFER = 10_000  # enough for ~100 packets/sec for 100 seconds
 history: Deque[VitalPacket] = deque(maxlen=N_BUFFER)
 latest: Optional[VitalPacket] = None
 latest_server_ts: Optional[float] = None
 
+# -------------------------------
+# WebSocket clients
+# -------------------------------
 connected_clients: List[WebSocket] = []
 
 # -------------------------------
@@ -37,27 +40,22 @@ connected_clients: List[WebSocket] = []
 # -------------------------------
 @app.post("/upload")
 async def upload_sensor_data(pkt: VitalPacket):
-    """
-    Receive a sensor packet and immediately broadcast it to all connected WebSockets.
-    """
     global latest, latest_server_ts
     latest = pkt
     latest_server_ts = time.time()
     history.append(pkt)
 
-    # Push immediately to all connected WebSocket clients
     disconnected = []
     for ws in connected_clients:
         try:
             await ws.send_json(pkt.dict())
+            print(f"[WebSocket] Sent packet to client: {pkt.dict()}")
         except Exception:
             disconnected.append(ws)
-    # Remove disconnected clients
     for ws in disconnected:
         connected_clients.remove(ws)
 
     return {"status": "ok", "count": len(history)}
-
 
 @app.get("/data/latest")
 def get_latest():
@@ -81,29 +79,35 @@ def get_recent(limit: int = 100):
 def health():
     return {"ok": True, "buffer_size": len(history)}
 
+# -------------------------------
+# WebSocket endpoint
+# -------------------------------
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    connected_clients.append(ws)
+    try:
+        while True:
+            await asyncio.sleep(1)  # keep connection alive
+    except WebSocketDisconnect:
+        connected_clients.remove(ws)
+    except Exception:
+        connected_clients.remove(ws)
+        await ws.close()
+
+
+# -------------------------------
+# Background task for logging (optional)
+# -------------------------------
 @app.on_event("startup")
 async def start_background_task():
     async def periodic_task():
         while True:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)  # half a second
             if latest:
                 print(f"[0.5s Task] Latest packet: {latest.dict()}")
     asyncio.create_task(periodic_task())
 
-# -------------------------------
-# WebSocket Endpoint
-# -------------------------------
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    connected_clients.append(websocket)
-    try:
-        while True:
-            await asyncio.sleep(1)  # keep connection alive
-    except Exception:
-        pass
-    finally:
-        connected_clients.remove(websocket)
 
 # -------------------------------
 # Run server
