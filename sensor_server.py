@@ -7,6 +7,7 @@ from collections import deque
 import time
 import asyncio
 import uvicorn
+import logging
 
 app = FastAPI(title="High-Frequency Sensor Server")
 
@@ -49,7 +50,9 @@ async def upload_sensor_data(pkt: VitalPacket):
     for ws in connected_clients:
         try:
             await ws.send_json(pkt.dict())
-            print(f"[WebSocket] Sent packet to client: {pkt.dict()}")
+            logger = logging.getLogger("sensor_server")
+            logging.basicConfig(level=logging.INFO)
+            logger.info(f"[WebSocket] Sent packet to client: {pkt.dict()}")
         except Exception:
             disconnected.append(ws)
     for ws in disconnected:
