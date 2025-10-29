@@ -10,6 +10,8 @@ import uvicorn
 import logging
 
 app = FastAPI(title="High-Frequency Sensor Server")
+logger = logging.getLogger("sensor_server")
+logging.basicConfig(level=logging.INFO)
 
 # -------------------------------
 # Model for incoming sensor data
@@ -50,8 +52,6 @@ async def upload_sensor_data(pkt: VitalPacket):
     for ws in connected_clients:
         try:
             await ws.send_json(pkt.dict())
-            logger = logging.getLogger("sensor_server")
-            logging.basicConfig(level=logging.INFO)
             logger.info(f"[WebSocket] Sent packet to client: {pkt.dict()}")
         except Exception:
             disconnected.append(ws)
@@ -108,7 +108,7 @@ async def start_background_task():
         while True:
             await asyncio.sleep(0.5)  # half a second
             if latest:
-                print(f"[0.5s Task] Latest packet: {latest.dict()}")
+               logger.info(f"[0.5s Task] Latest packet: {latest.dict()}")
     asyncio.create_task(periodic_task())
 
 
