@@ -1,5 +1,4 @@
-# sensor_server.py
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, WebSocket
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Deque, Optional, List
@@ -50,7 +49,7 @@ def get_latest():
     Return the most recent sensor packet.
     """
     if latest is None:
-        return JSONResponse(content={"error": "No data yet"}, status_code=404)
+        return {"message": "No data from sensor yet", "packet": None}
     return {
         "received_at": latest_server_ts,
         "packet": latest.dict(),
@@ -62,9 +61,9 @@ def get_recent(limit: int = 100):
     Return the most recent N packets.
     """
     if not history:
-        return JSONResponse(content={"error": "No data yet"}, status_code=404)
+        return {"message": "No data from sensor yet", "packets": []}
     limit = max(1, min(limit, len(history)))
-    return [p.dict() for p in list(history)[-limit:]]
+    return {"packets": [p.dict() for p in list(history)[-limit:]]}
 
 @app.get("/health")
 def health():
@@ -87,6 +86,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 new_data = [p.dict() for p in list(history)[last_index:]]
                 await websocket.send_json(new_data)
                 last_index = len(history)
+            elif len(history) == 0:
+                # send a message if no data
+                await websocket.send_json({"message": "No data from sensor yet", "packets": []})
     except Exception:
         await websocket.close()
 
