@@ -1,3 +1,4 @@
+# sensor_server.py
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -22,12 +23,14 @@ class VitalPacket(BaseModel):
     spo2_pct: float
 
 # -------------------------------
-# Rolling buffer setup
+# Rolling buffer and WebSocket clients
 # -------------------------------
-N_BUFFER = 10_000  # enough for ~100 packets/sec for 100 seconds
+N_BUFFER = 10_000  # store ~100 packets/sec for 100 seconds
 history: Deque[VitalPacket] = deque(maxlen=N_BUFFER)
 latest: Optional[VitalPacket] = None
 latest_server_ts: Optional[float] = None
+
+connected_clients: List[WebSocket] = []
 
 # -------------------------------
 # HTTP Endpoints
@@ -35,62 +38,63 @@ latest_server_ts: Optional[float] = None
 @app.post("/upload")
 async def upload_sensor_data(pkt: VitalPacket):
     """
-    Endpoint to receive sensor packets (called ~100 times per second).
+    Receive a sensor packet and immediately broadcast it to all connected WebSockets.
     """
     global latest, latest_server_ts
     latest = pkt
     latest_server_ts = time.time()
     history.append(pkt)
+
+    # Push immediately to all connected WebSocket clients
+    disconnected = []
+    for ws in connected_clients:
+        try:
+            await ws.send_json(pkt.dict())
+        except Exception:
+            disconnected.append(ws)
+    # Remove disconnected clients
+    for ws in disconnected:
+        connected_clients.remove(ws)
+
     return {"status": "ok", "count": len(history)}
+
 
 @app.get("/data/latest")
 def get_latest():
-    """
-    Return the most recent sensor packet.
-    """
     if latest is None:
-        return {"message": "No data from sensor yet", "packet": None}
+        return JSONResponse(content={"message": "No data from sensor yet"}, status_code=404)
     return {
         "received_at": latest_server_ts,
         "packet": latest.dict(),
     }
 
+
 @app.get("/data/recent")
 def get_recent(limit: int = 100):
-    """
-    Return the most recent N packets.
-    """
     if not history:
-        return {"message": "No data from sensor yet", "packets": []}
+        return JSONResponse(content={"message": "No data from sensor yet"}, status_code=404)
     limit = max(1, min(limit, len(history)))
-    return {"packets": [p.dict() for p in list(history)[-limit:]]}
+    return [p.dict() for p in list(history)[-limit:]]
+
 
 @app.get("/health")
 def health():
-    """
-    Health check endpoint.
-    """
     return {"ok": True, "buffer_size": len(history)}
 
 # -------------------------------
-# WebSocket for real-time streaming
+# WebSocket Endpoint
 # -------------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    last_index = len(history)
+    connected_clients.append(websocket)
     try:
         while True:
-            await asyncio.sleep(0.01)  # 10ms interval = ~100Hz
-            if len(history) > last_index:
-                new_data = [p.dict() for p in list(history)[last_index:]]
-                await websocket.send_json(new_data)
-                last_index = len(history)
-            elif len(history) == 0:
-                # send a message if no data
-                await websocket.send_json({"message": "No data from sensor yet", "packets": []})
+            await asyncio.sleep(1)  # keep connection alive
     except Exception:
-        await websocket.close()
+        pass
+    finally:
+        connected_clients.remove(websocket)
 
 # -------------------------------
 # Run server
