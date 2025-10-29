@@ -49,8 +49,10 @@ async def upload_sensor_data(pkt: VitalPacket):
     history.append(pkt)
 
     disconnected = []
+    logger.info(f"[Upload] Received packet from sensor: {pkt.dict()}")
     for ws in connected_clients:
         try:
+            logger.info(f"[WebSocket] Sending packet to client #{i}")
             await ws.send_json(pkt.dict())
             logger.info(f"[WebSocket] Sent packet to client: {pkt.dict()}")
         except Exception:
