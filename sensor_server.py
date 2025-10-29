@@ -56,10 +56,10 @@ async def upload_sensor_data(pkt: VitalPacket):
             await ws.send_json(pkt.dict())
             logger.info(f"[WebSocket] Sent packet to client: {pkt.dict()}")
         except Exception:
+            logger.info(f"[WebSocket] exception")
             disconnected.append(ws)
     for ws in disconnected:
         connected_clients.remove(ws)
-
     return {"status": "ok", "count": len(history)}
 
 @app.get("/data/latest")
@@ -91,13 +91,16 @@ def health():
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     connected_clients.append(ws)
+    logger.info(f"[WebSocket] Client connected, total clients: {len(connected_clients)}")
     try:
         while True:
             await asyncio.sleep(1)  # keep connection alive
     except WebSocketDisconnect:
         connected_clients.remove(ws)
-    except Exception:
+        logger.info(f"[WebSocket] Client disconnected, total clients: {len(connected_clients)}")
+    except Exception as e:
         connected_clients.remove(ws)
+        logger.error(f"[WebSocket] Exception: {e}")
         await ws.close()
 
 
