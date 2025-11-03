@@ -104,7 +104,7 @@ async def websocket_endpoint(ws: WebSocket):
 async def start_background_task():
     async def periodic_task():
         while True:
-            await asyncio.sleep(0.1)  # half a second
+            await asyncio.sleep(0.1) 
             if latest:
                logger.info(f"[0.1s Task] Latest packet: {latest.dict()}")
     asyncio.create_task(periodic_task())
