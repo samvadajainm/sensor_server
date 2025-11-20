@@ -146,6 +146,25 @@ async def get_24h_data():
 def health():
     return {"ok": True, "buffer_size": len(history)}
 
+@app.get("/data/idle_time")
+async def get_idle_time():
+    if pg_pool is None:
+        return JSONResponse(content={"message": "Database not initialized"}, status_code=500)
+
+    async with pg_pool.acquire() as conn:
+        # Calculate idle minutes over last 24 hours
+        result = await conn.fetchval("""
+            SELECT COUNT(*) FROM (
+                SELECT 
+                    SQRT(POWER(ax_g, 2) + POWER(ay_g, 2) + POWER(az_g - 1, 2)) AS magnitude
+                FROM minute_average
+                WHERE minute_start >= NOW() - INTERVAL '24 hours'
+            ) AS sub
+            WHERE magnitude < 0.55
+        """)
+
+    return {"idle_minutes_last_24h": result}
+
 # -------------------------------
 # WebSocket endpoint
 # -------------------------------
