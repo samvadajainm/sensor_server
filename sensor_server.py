@@ -9,6 +9,7 @@ import asyncio
 import uvicorn
 import logging
 import os
+import json
 import asyncpg
 from statistics import mean
 from datetime import datetime, timedelta
@@ -146,25 +147,6 @@ async def get_24h_data():
 def health():
     return {"ok": True, "buffer_size": len(history)}
 
-@app.get("/data/idle_time")
-async def get_idle_time():
-    if pg_pool is None:
-        return JSONResponse(content={"message": "Database not initialized"}, status_code=500)
-
-    async with pg_pool.acquire() as conn:
-        # Calculate idle minutes over last 24 hours
-        result = await conn.fetchval("""
-            SELECT COUNT(*) FROM (
-                SELECT 
-                    SQRT(POWER(ax_g, 2) + POWER(ay_g, 2) + POWER(az_g - 1, 2)) AS magnitude
-                FROM minute_average
-                WHERE minute_start >= NOW() - INTERVAL '24 hours'
-            ) AS sub
-            WHERE magnitude < 0.55
-        """)
-
-    return {"idle_minutes_last_24h": result}
-
 # -------------------------------
 # WebSocket endpoint
 # -------------------------------
@@ -172,6 +154,26 @@ async def get_idle_time():
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     connected_clients.append(ws)
+    async def send_idle_time_periodically():
+        while True:
+            if pg_pool:
+                async with pg_pool.acquire() as conn:
+                    idle_minutes = await conn.fetchval("""
+                        SELECT COUNT(*) FROM (
+                            SELECT SQRT(POWER(ax_g, 2) + POWER(ay_g, 2) + POWER(az_g - 1, 2)) AS magnitude
+                            FROM minute_average
+                            WHERE minute_start >= NOW() - INTERVAL '24 hours'
+                        ) AS sub
+                        WHERE magnitude < 0.55
+                    """)
+                try:
+                    await ws.send_json({"type": "idle_time", "idle_minutes": idle_minutes})
+                except Exception:
+                    break
+            await asyncio.sleep(60)
+
+    # Start the background task for this WebSocket client
+    asyncio.create_task(send_idle_time_periodically())
     try:
         while True:
             await asyncio.sleep(1)  # keep connection alive
