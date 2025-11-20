@@ -8,6 +8,7 @@ import time
 import asyncio
 import uvicorn
 import logging
+import os
 import asyncpg
 from statistics import mean
 from datetime import datetime, timedelta
@@ -44,8 +45,11 @@ connected_clients: List[WebSocket] = []
 # -------------------------------
 # PostgreSQL configuration
 # -------------------------------
-import os
-POSTGRES_DSN = os.getenv("postgresql://sensordata_twcy_user:QMpGEMAS0nfjTgOAvOmP0qnDGPZajLIV@dpg-d4fja5trnu6s73e5l820-a/sensordata_twcy")
+
+POSTGRES_DSN = os.getenv(
+    "DATABASE_URL",
+    "postgresql://sensordata_twcy_user:QMpGEMAS0nfjTgOAvOmP0qnDGPZajLIV@localhost/sensordata_twcy"
+)
 pg_pool: Optional[asyncpg.pool.Pool] = None
 
 # -------------------------------
