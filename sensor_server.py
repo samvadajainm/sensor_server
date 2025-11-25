@@ -33,7 +33,7 @@ class VitalPacket(BaseModel):
 # -------------------------------
 # Rolling buffer
 # -------------------------------
-N_BUFFER = 10_000  # enough for ~100 packets/sec for 100 seconds
+N_BUFFER = 10_000
 history: Deque[VitalPacket] = deque(maxlen=N_BUFFER)
 latest: Optional[VitalPacket] = None
 latest_server_ts: Optional[float] = None
@@ -46,7 +46,6 @@ connected_clients: List[WebSocket] = []
 # -------------------------------
 # PostgreSQL configuration
 # -------------------------------
-
 POSTGRES_DSN = os.getenv(
     "DATABASE_URL",
     "postgresql://sensordata_twcy_user:QMpGEMAS0nfjTgOAvOmP0qnDGPZajLIV@localhost/sensordata_twcy"
@@ -58,6 +57,12 @@ pg_pool: Optional[asyncpg.pool.Pool] = None
 # -------------------------------
 minute_buffer: List[VitalPacket] = []
 minute_start_time: Optional[float] = None
+
+# -------------------------------
+# Idle time tracking
+# -------------------------------
+last_idle_reset: Optional[datetime] = None
+idle_minutes_today: int = 0
 
 # -------------------------------
 # HTTP Endpoints
@@ -85,7 +90,7 @@ async def upload_sensor_data(pkt: VitalPacket):
     for ws in disconnected:
         connected_clients.remove(ws)
 
-    # Optional: Store raw packet in PostgreSQL (comment if not needed)
+    # Optional: Store raw packet in PostgreSQL
     if pg_pool:
         async with pg_pool.acquire() as conn:
             await conn.execute(
@@ -98,7 +103,6 @@ async def upload_sensor_data(pkt: VitalPacket):
 
     return {"status": "ok", "count": len(history)}
 
-
 @app.get("/data/latest")
 def get_latest():
     if latest is None:
@@ -108,14 +112,12 @@ def get_latest():
         "packet": latest.dict(),
     }
 
-
 @app.get("/data/recent")
 def get_recent(limit: int = 100):
     if not history:
         return JSONResponse(content={"message": "No data from sensor yet"}, status_code=404)
     limit = max(1, min(limit, len(history)))
     return [p.dict() for p in list(history)[-limit:]]
-
 
 @app.get("/data/24h")
 async def get_24h_data():
@@ -142,6 +144,37 @@ async def get_24h_data():
         } for r in rows
     ]
 
+@app.get("/data/idle_time")
+async def get_idle_time():
+    """
+    Returns idle minutes in the last 24 hours.
+    Resets at midnight.
+    """
+    global last_idle_reset, idle_minutes_today
+
+    now = datetime.utcnow()
+
+    # Reset at midnight UTC
+    if last_idle_reset is None or now.date() != last_idle_reset.date():
+        idle_minutes_today = 0
+        last_idle_reset = now
+
+    idle_count = 0
+    if pg_pool:
+        async with pg_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT SQRT(POWER(ax_g,2)+POWER(ay_g,2)+POWER(az_g-1,2)) AS magnitude
+                FROM minute_average
+                WHERE minute_start >= NOW() - INTERVAL '24 hours'
+                """
+            )
+            for r in rows:
+                if r["magnitude"] < 0.55:
+                    idle_count += 1
+
+    idle_minutes_today = idle_count
+    return {"idle_minutes": idle_minutes_today}
 
 @app.get("/health")
 def health():
@@ -154,11 +187,12 @@ def health():
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     connected_clients.append(ws)
+
     async def send_idle_time_periodically():
         while True:
             if pg_pool:
                 async with pg_pool.acquire() as conn:
-                    idle_minutes = await conn.fetchval("""
+                    idle_count = await conn.fetchval("""
                         SELECT COUNT(*) FROM (
                             SELECT SQRT(POWER(ax_g, 2) + POWER(ay_g, 2) + POWER(az_g - 1, 2)) AS magnitude
                             FROM minute_average
@@ -167,16 +201,16 @@ async def websocket_endpoint(ws: WebSocket):
                         WHERE magnitude < 0.55
                     """)
                 try:
-                    await ws.send_json({"type": "idle_time", "idle_minutes": idle_minutes})
+                    await ws.send_json({"type": "idle_time", "idle_minutes": idle_count})
                 except Exception:
                     break
             await asyncio.sleep(60)
 
-    # Start the background task for this WebSocket client
+    # Start background task for this WebSocket client
     asyncio.create_task(send_idle_time_periodically())
     try:
         while True:
-            await asyncio.sleep(1)  # keep connection alive
+            await asyncio.sleep(1)
     except WebSocketDisconnect:
         connected_clients.remove(ws)
     except Exception:
@@ -190,14 +224,13 @@ async def minute_aggregator_task():
     global minute_buffer, minute_start_time
 
     while True:
-        await asyncio.sleep(1)  # check every second
+        await asyncio.sleep(1)
 
         if minute_start_time is None or len(minute_buffer) == 0:
             continue
 
         elapsed = time.time() - minute_start_time
-        if elapsed >= 60:  # 1 minute passed
-            # Compute averages
+        if elapsed >= 60:
             avg_ax = mean(p.ax_g for p in minute_buffer)
             avg_ay = mean(p.ay_g for p in minute_buffer)
             avg_az = mean(p.az_g for p in minute_buffer)
@@ -206,7 +239,6 @@ async def minute_aggregator_task():
 
             minute_start_dt = datetime.utcfromtimestamp(minute_start_time)
 
-            # Store computed averages in PostgreSQL
             if pg_pool:
                 async with pg_pool.acquire() as conn:
                     await conn.execute(
@@ -216,28 +248,22 @@ async def minute_aggregator_task():
                         """,
                         minute_start_dt, avg_ax, avg_ay, avg_az, avg_bpm, avg_spo2
                     )
-
-                    # Delete older than 24 hours
                     await conn.execute(
                         "DELETE FROM minute_average WHERE minute_start < NOW() - INTERVAL '24 hours'"
                     )
 
-            # Clear buffer
             minute_buffer = []
             minute_start_time = time.time()
 
-
 # -------------------------------
-# Startup event: initialize DB and background tasks
+# Startup event
 # -------------------------------
 @app.on_event("startup")
 async def startup_event():
     global pg_pool
-    # Initialize PostgreSQL pool
     pg_pool = await asyncpg.create_pool(dsn=POSTGRES_DSN, min_size=1, max_size=5)
     logger.info("PostgreSQL connection pool created")
 
-    # Ensure tables exist
     async with pg_pool.acquire() as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS raw_packets (
@@ -264,17 +290,15 @@ async def startup_event():
         )
         """)
 
-    # Start background tasks
     asyncio.create_task(minute_aggregator_task())
 
-    # Existing optional logging task
+    # Optional logging task
     async def periodic_task():
         while True:
             await asyncio.sleep(0.1)
             if latest:
                 logger.info(f"[0.1s Task] Latest packet: {latest.dict()}")
     asyncio.create_task(periodic_task())
-
 
 # -------------------------------
 # Run server
