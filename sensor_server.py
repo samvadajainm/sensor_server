@@ -10,7 +10,7 @@ import uvicorn
 import logging
 import os
 import math
-from statistics import mean
+from statistics import mean, variance
 from datetime import datetime
 import asyncpg
 
@@ -129,6 +129,29 @@ async def get_idle_time():
 def health():
     return {"ok": True, "buffer_size": len(history)}
 
+@app.get("/data/variance")
+def get_bpm_variance(limit: int = 100):
+    """Calculate variance for the last `limit` heart rate values"""
+    if not history:
+        return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
+
+    # Take the last N packets
+    limit = max(1, min(limit, len(history)))
+    recent_packets = list(history)[-limit:]
+
+    # Extract bpm values
+    bpm_values = [p.bpm for p in recent_packets]
+
+    # Calculate mean and variance
+    mean_bpm = mean(bpm_values)
+    var_bpm = variance(bpm_values) if len(bpm_values) > 1 else 0.0
+
+    return {
+        "mean_bpm": mean_bpm,
+        "var_bpm": var_bpm,
+        "count": len(bpm_values)
+    }
+
 @app.get("/data/24h")
 async def get_24h_graph():
     """Return last 24 hours of minute averages including variance"""
@@ -138,7 +161,7 @@ async def get_24h_graph():
     async with pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT minute_start, bpm AS mean_bpm, var_bpm
+            SELECT minute_start, mean_bpm, var_bpm
             FROM minute_average
             WHERE minute_start >= NOW() - INTERVAL '24 hours'
             ORDER BY minute_start ASC
@@ -160,8 +183,6 @@ async def get_24h_graph():
 
         print(f"[24h Graph] Total points: {len(data)}")
         return data
-
-
 
 # -------------------------------
 # WebSocket endpoint
@@ -237,6 +258,45 @@ async def per_second_aggregator_task():
             logger.debug(f"[Idle] magnitude={magnitude:.3f}, idle_seconds_today={idle_seconds_today}")
 
 # -------------------------------
+# Background task: per-minute BPM variance calculation
+# -------------------------------
+async def per_minute_aggregator_task():
+    """Calculate mean and variance of BPM per minute and store in DB"""
+    while True:
+        await asyncio.sleep(60)  # run every minute
+
+        if len(history) == 0:
+            continue
+
+        now = time.time()
+        one_min_ago = now - 60
+        last_minute_packets = [p for p in history if p.ts_ms / 1000 >= one_min_ago]
+
+        if not last_minute_packets:
+            continue
+
+        bpm_values = [p.bpm for p in last_minute_packets]
+        mean_bpm = mean(bpm_values)
+        var_bpm = variance(bpm_values) if len(bpm_values) > 1 else 0.0
+
+        # Round minute_start to the start of the minute
+        minute_start = datetime.fromtimestamp(now).replace(second=0, microsecond=0)
+
+        if pg_pool:
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO minute_average (minute_start, mean_bpm, var_bpm)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (minute_start) DO UPDATE
+                    SET mean_bpm = EXCLUDED.mean_bpm, var_bpm = EXCLUDED.var_bpm
+                    """,
+                    minute_start, mean_bpm, var_bpm
+                )
+
+        logger.info(f"[Minute Aggregator] {minute_start} mean_bpm={mean_bpm:.2f} var_bpm={var_bpm:.2f}")
+
+# -------------------------------
 # Startup
 # -------------------------------
 @app.on_event("startup")
@@ -266,9 +326,17 @@ async def startup_event():
             idle_minutes INT
         )
         """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS minute_average (
+            minute_start TIMESTAMP PRIMARY KEY,
+            mean_bpm REAL,
+            var_bpm REAL
+        )
+        """)
 
-    # Start background task
+    # Start background tasks
     asyncio.create_task(per_second_aggregator_task())
+    asyncio.create_task(per_minute_aggregator_task())
 
 # -------------------------------
 # Run server
