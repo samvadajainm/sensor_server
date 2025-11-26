@@ -64,7 +64,6 @@ pg_pool: Optional[asyncpg.pool.Pool] = None
 # -------------------------------
 @app.post("/upload")
 async def upload_sensor_data(pkt: VitalPacket):
-    """Receive a single sensor packet and store it in memory & DB"""
     global latest, latest_server_ts, second_buffer, second_start_time
 
     latest = pkt
@@ -114,7 +113,6 @@ def get_recent(limit: int = 100):
 
 @app.get("/data/idle_time")
 async def get_idle_time():
-    """Fetch idle minutes from DB for today"""
     if pg_pool is None:
         return JSONResponse({"message": "DB not initialized"}, status_code=500)
 
@@ -129,29 +127,6 @@ async def get_idle_time():
 def health():
     return {"ok": True, "buffer_size": len(history)}
 
-@app.get("/data/variance")
-def get_bpm_variance(limit: int = 100):
-    """Calculate variance for the last `limit` heart rate values"""
-    if not history:
-        return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
-
-    # Take the last N packets
-    limit = max(1, min(limit, len(history)))
-    recent_packets = list(history)[-limit:]
-
-    # Extract bpm values
-    bpm_values = [p.bpm for p in recent_packets]
-
-    # Calculate mean and variance
-    mean_bpm = mean(bpm_values)
-    var_bpm = variance(bpm_values) if len(bpm_values) > 1 else 0.0
-
-    return {
-        "mean_bpm": mean_bpm,
-        "var_bpm": var_bpm,
-        "count": len(bpm_values)
-    }
-
 @app.get("/data/24h")
 async def get_24h_graph():
     """Return last 24 hours of minute averages including variance"""
@@ -161,7 +136,7 @@ async def get_24h_graph():
     async with pg_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT minute_start, mean_bpm, var_bpm
+            SELECT minute_start, bpm AS mean_bpm, var_bpm
             FROM minute_average
             WHERE minute_start >= NOW() - INTERVAL '24 hours'
             ORDER BY minute_start ASC
@@ -175,11 +150,10 @@ async def get_24h_graph():
             var_bpm = r["var_bpm"]
             data.append({
                 "timestamp": ts,
-                "mean_bpm": mean_bpm,
-                "var_bpm": var_bpm
+                "mean": mean_bpm,
+                "variance": var_bpm
             })
-            # Log the values
-            print(f"[24h Graph] ts={ts}, mean_bpm={mean_bpm}, var_bpm={var_bpm}")
+            print(f"[24h Graph] ts={ts}, mean={mean_bpm}, var={var_bpm}")
 
         print(f"[24h Graph] Total points: {len(data)}")
         return data
@@ -230,7 +204,6 @@ async def per_second_aggregator_task():
 
         elapsed = time.time() - second_start_time
         if elapsed >= 1.0:
-            # Compute average acceleration for the second
             avg_ax = mean([p.ax_g for p in second_buffer])
             avg_ay = mean([p.ay_g for p in second_buffer])
             avg_az = mean([p.az_g for p in second_buffer])
@@ -239,11 +212,9 @@ async def per_second_aggregator_task():
             if magnitude < 0.55:
                 idle_seconds_today += 1
 
-            # Clear buffer for next second
             second_buffer = []
             second_start_time = time.time()
 
-            # Update DB every 60 seconds
             if idle_seconds_today % 60 == 0 and pg_pool:
                 async with pg_pool.acquire() as conn:
                     await conn.execute(
@@ -258,43 +229,34 @@ async def per_second_aggregator_task():
             logger.debug(f"[Idle] magnitude={magnitude:.3f}, idle_seconds_today={idle_seconds_today}")
 
 # -------------------------------
-# Background task: per-minute BPM variance calculation
+# Background task: per-minute BPM aggregation with variance
 # -------------------------------
-async def per_minute_aggregator_task():
-    """Calculate mean and variance of BPM per minute and store in DB"""
+async def per_minute_aggregation_task():
     while True:
         await asyncio.sleep(60)  # run every minute
-
-        if len(history) == 0:
+        if pg_pool is None or not history:
             continue
 
-        now = time.time()
-        one_min_ago = now - 60
-        last_minute_packets = [p for p in history if p.ts_ms / 1000 >= one_min_ago]
+        async with pg_pool.acquire() as conn:
+            # Fetch last minute of data from memory
+            now_ts = time.time()
+            one_min_ago_ts = now_ts - 60
+            last_minute_packets = [p for p in history if p.ts_ms / 1000 >= one_min_ago_ts]
 
-        if not last_minute_packets:
-            continue
+            bpm_values = [p.bpm for p in last_minute_packets]
+            if bpm_values:
+                mean_bpm = mean(bpm_values)
+                var_bpm = variance(bpm_values) if len(bpm_values) > 1 else 0.0
 
-        bpm_values = [p.bpm for p in last_minute_packets]
-        mean_bpm = mean(bpm_values)
-        var_bpm = variance(bpm_values) if len(bpm_values) > 1 else 0.0
-
-        # Round minute_start to the start of the minute
-        minute_start = datetime.fromtimestamp(now).replace(second=0, microsecond=0)
-
-        if pg_pool:
-            async with pg_pool.acquire() as conn:
                 await conn.execute(
                     """
-                    INSERT INTO minute_average (minute_start, mean_bpm, var_bpm)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (minute_start) DO UPDATE
-                    SET mean_bpm = EXCLUDED.mean_bpm, var_bpm = EXCLUDED.var_bpm
+                    INSERT INTO minute_average (minute_start, bpm, var_bpm)
+                    VALUES (to_timestamp($1), $2, $3)
+                    ON CONFLICT (minute_start) DO UPDATE SET bpm=$2, var_bpm=$3
                     """,
-                    minute_start, mean_bpm, var_bpm
+                    int(one_min_ago_ts), mean_bpm, var_bpm
                 )
-
-        logger.info(f"[Minute Aggregator] {minute_start} mean_bpm={mean_bpm:.2f} var_bpm={var_bpm:.2f}")
+                logger.info(f"[Minute Aggregate] mean={mean_bpm:.2f}, var={var_bpm:.2f}, count={len(bpm_values)}")
 
 # -------------------------------
 # Startup
@@ -329,14 +291,14 @@ async def startup_event():
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS minute_average (
             minute_start TIMESTAMP PRIMARY KEY,
-            mean_bpm REAL,
+            bpm REAL,
             var_bpm REAL
         )
         """)
 
     # Start background tasks
     asyncio.create_task(per_second_aggregator_task())
-    asyncio.create_task(per_minute_aggregator_task())
+    asyncio.create_task(per_minute_aggregation_task())
 
 # -------------------------------
 # Run server
