@@ -156,9 +156,9 @@ async def get_24h_graph():
                 "var_bpm": var_bpm
             })
             # Log the values
-            logger.info(f"[24h Graph] ts={ts}, mean_bpm={mean_bpm}, var_bpm={var_bpm}")
+            print(f"[24h Graph] ts={ts}, mean_bpm={mean_bpm}, var_bpm={var_bpm}")
 
-        logger.info(f"[24h Graph] Total points: {len(data)}")
+        print(f"[24h Graph] Total points: {len(data)}")
         return data
 
 
