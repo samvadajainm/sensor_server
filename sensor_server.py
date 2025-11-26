@@ -129,6 +129,40 @@ async def get_idle_time():
 def health():
     return {"ok": True, "buffer_size": len(history)}
 
+@app.get("/data/24h")
+async def get_24h_graph():
+    """Return last 24 hours of minute averages including variance"""
+    if pg_pool is None:
+        return JSONResponse({"message": "DB not initialized"}, status_code=500)
+
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT minute_start, bpm AS mean_bpm, var_bpm
+            FROM minute_average
+            WHERE minute_start >= NOW() - INTERVAL '24 hours'
+            ORDER BY minute_start ASC
+            """
+        )
+
+        data = []
+        for r in rows:
+            ts = int(r["minute_start"].timestamp() * 1000)
+            mean_bpm = r["mean_bpm"]
+            var_bpm = r["var_bpm"]
+            data.append({
+                "timestamp": ts,
+                "mean_bpm": mean_bpm,
+                "var_bpm": var_bpm
+            })
+            # Log the values
+            logger.info(f"[24h Graph] ts={ts}, mean_bpm={mean_bpm}, var_bpm={var_bpm}")
+
+        logger.info(f"[24h Graph] Total points: {len(data)}")
+        return data
+
+
+
 # -------------------------------
 # WebSocket endpoint
 # -------------------------------
