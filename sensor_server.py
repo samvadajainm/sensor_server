@@ -148,6 +148,8 @@ async def websocket_endpoint(ws: WebSocket):
                         "SELECT idle_minutes FROM idle_time WHERE day = CURRENT_DATE"
                     )
                     idle_minutes = row["idle_minutes"] if row else 0
+                    logger.info(f"[Idle Time Endpoint] Returning idle_minutes={idle_minutes}")
+
                     try:
                         await ws.send_json({"type": "idle_time", "idle_minutes": idle_minutes})
                     except Exception:
@@ -253,6 +255,13 @@ async def minute_aggregator_task():
                     )
 
             # Clear buffer
+            logger.info(
+    f"[Minute Aggregate] {minute_start_dt}: "
+    f"var_ax={var_ax:.4f}, var_ay={var_ay:.4f}, var_az={var_az:.4f}, "
+    f"var_bpm={var_bpm:.2f}, var_spo2={var_spo2:.2f}, "
+    f"idle_minutes={idle_count}"
+)
+
             minute_buffer = []
             minute_start_time = time.time()
 
