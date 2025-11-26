@@ -1,7 +1,7 @@
 # sensor_server.py
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Deque, Optional, List
 from collections import deque
 import time
@@ -11,7 +11,7 @@ import logging
 import os
 import math
 from statistics import mean
-from datetime import datetime, timedelta
+from datetime import datetime
 import asyncpg
 
 # -------------------------------
@@ -41,8 +41,9 @@ history: Deque[VitalPacket] = deque(maxlen=N_BUFFER)
 latest: Optional[VitalPacket] = None
 latest_server_ts: Optional[float] = None
 
-minute_buffer: List[VitalPacket] = []
-minute_start_time: Optional[float] = None
+second_buffer: List[VitalPacket] = []
+second_start_time: Optional[float] = None
+idle_seconds_today: int = 0
 
 # -------------------------------
 # WebSocket clients
@@ -64,16 +65,16 @@ pg_pool: Optional[asyncpg.pool.Pool] = None
 @app.post("/upload")
 async def upload_sensor_data(pkt: VitalPacket):
     """Receive a single sensor packet and store it in memory & DB"""
-    global latest, latest_server_ts, minute_buffer, minute_start_time
+    global latest, latest_server_ts, second_buffer, second_start_time
 
     latest = pkt
     latest_server_ts = time.time()
     history.append(pkt)
 
-    # Add to minute buffer
-    if minute_start_time is None:
-        minute_start_time = time.time()
-    minute_buffer.append(pkt)
+    # Add to second buffer
+    if second_start_time is None:
+        second_start_time = time.time()
+    second_buffer.append(pkt)
 
     # Forward to WebSocket clients
     disconnected = []
@@ -113,17 +114,13 @@ def get_recent(limit: int = 100):
 
 @app.get("/data/idle_time")
 async def get_idle_time():
-    """Fetch the precomputed idle minutes from DB for today"""
+    """Fetch idle minutes from DB for today"""
     if pg_pool is None:
         return JSONResponse({"message": "DB not initialized"}, status_code=500)
 
     async with pg_pool.acquire() as conn:
         row = await conn.fetchrow(
-            """
-            SELECT idle_minutes
-            FROM idle_time
-            WHERE day = CURRENT_DATE
-            """
+            "SELECT idle_minutes FROM idle_time WHERE day = CURRENT_DATE"
         )
         idle_minutes = row["idle_minutes"] if row else 0
     return {"idle_minutes": idle_minutes}
@@ -148,8 +145,6 @@ async def websocket_endpoint(ws: WebSocket):
                         "SELECT idle_minutes FROM idle_time WHERE day = CURRENT_DATE"
                     )
                     idle_minutes = row["idle_minutes"] if row else 0
-                    logger.info(f"[Idle Time Endpoint] Returning idle_minutes={idle_minutes}")
-
                     try:
                         await ws.send_json({"type": "idle_time", "idle_minutes": idle_minutes})
                     except Exception:
@@ -168,102 +163,44 @@ async def websocket_endpoint(ws: WebSocket):
         await ws.close()
 
 # -------------------------------
-# Background task: Minute aggregation + idle time
+# Background task: per-second idle calculation
 # -------------------------------
-async def minute_aggregator_task():
-    global minute_buffer, minute_start_time
+async def per_second_aggregator_task():
+    global second_buffer, second_start_time, idle_seconds_today
 
     while True:
-        await asyncio.sleep(1)
-        if minute_start_time is None or len(minute_buffer) == 0:
+        await asyncio.sleep(0.5)
+        if second_start_time is None or len(second_buffer) == 0:
             continue
 
-        elapsed = time.time() - minute_start_time
-        if elapsed >= 60:
-            # Compute minute averages
-            ax_list = [p.ax_g for p in minute_buffer]
-            ay_list = [p.ay_g for p in minute_buffer]
-            az_list = [p.az_g for p in minute_buffer]
-            bpm_list = [float(p.bpm) for p in minute_buffer]
-            spo2_list = [p.spo2_pct for p in minute_buffer]
+        elapsed = time.time() - second_start_time
+        if elapsed >= 1.0:
+            # Compute average acceleration for the second
+            avg_ax = mean([p.ax_g for p in second_buffer])
+            avg_ay = mean([p.ay_g for p in second_buffer])
+            avg_az = mean([p.az_g for p in second_buffer])
 
-            mean_ax = mean(ax_list)
-            mean_ay = mean(ay_list)
-            mean_az = mean(az_list)
-            mean_bpm = mean(bpm_list)
-            mean_spo2 = mean(spo2_list)
+            magnitude = math.sqrt(avg_ax**2 + avg_ay**2 + (avg_az - 1)**2)
+            if magnitude < 0.55:
+                idle_seconds_today += 1
 
-            var_ax = mean([(x - mean_ax)**2 for x in ax_list])
-            var_ay = mean([(y - mean_ay)**2 for y in ay_list])
-            var_az = mean([(z - mean_az)**2 for z in az_list])
-            var_bpm = mean([(b - mean_bpm)**2 for b in bpm_list])
-            var_spo2 = mean([(s - mean_spo2)**2 for s in spo2_list])
+            # Clear buffer for next second
+            second_buffer = []
+            second_start_time = time.time()
 
-            std_ax = math.sqrt(var_ax)
-            std_ay = math.sqrt(var_ay)
-            std_az = math.sqrt(var_az)
-            std_bpm = math.sqrt(var_bpm)
-            std_spo2 = math.sqrt(var_spo2)
-
-            minute_start_dt = datetime.utcnow()
-
-            if pg_pool:
+            # Update DB every 60 seconds
+            if idle_seconds_today % 60 == 0 and pg_pool:
                 async with pg_pool.acquire() as conn:
-                    # Store minute aggregates
-                    await conn.execute(
-                        """
-                        INSERT INTO minute_average (
-                            minute_start,
-                            ax_g, ay_g, az_g,
-                            var_ax, var_ay, var_az,
-                            std_ax, std_ay, std_az,
-                            bpm, var_bpm, std_bpm,
-                            spo2_pct, var_spo2, std_spo2
-                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-                        """,
-                        minute_start_dt,
-                        mean_ax, mean_ay, mean_az,
-                        var_ax, var_ay, var_az,
-                        std_ax, std_ay, std_az,
-                        mean_bpm, var_bpm, std_bpm,
-                        mean_spo2, var_spo2, std_spo2
-                    )
-
-                    # Compute idle minutes for today
-                    rows = await conn.fetch(
-                        "SELECT ax_g, ay_g, az_g FROM minute_average WHERE minute_start >= DATE_TRUNC('day', NOW())"
-                    )
-                    idle_count = 0
-                    for r in rows:
-                        magnitude = math.sqrt(r["ax_g"]**2 + r["ay_g"]**2 + (r["az_g"] - 1)**2)
-                        if magnitude < 0.55:
-                            idle_count += 1
-
-                    # Upsert into idle_time table
                     await conn.execute(
                         """
                         INSERT INTO idle_time(day, idle_minutes)
                         VALUES (CURRENT_DATE, $1)
                         ON CONFLICT (day) DO UPDATE SET idle_minutes = $1
                         """,
-                        idle_count
+                        idle_seconds_today // 60
                     )
 
-                    # Delete old minute averages (>24h)
-                    await conn.execute(
-                        "DELETE FROM minute_average WHERE minute_start < NOW() - INTERVAL '24 hours'"
-                    )
-
-            # Clear buffer
-            logger.info(
-    f"[Minute Aggregate] {minute_start_dt}: "
-    f"var_ax={var_ax:.4f}, var_ay={var_ay:.4f}, var_az={var_az:.4f}, "
-    f"var_bpm={var_bpm:.2f}, var_spo2={var_spo2:.2f}, "
-    f"idle_minutes={idle_count}"
-)
-
-            minute_buffer = []
-            minute_start_time = time.time()
+            logger.debug(f"[Idle] magnitude={magnitude:.3f}, idle_seconds_today={idle_seconds_today}")
 
 # -------------------------------
 # Startup
@@ -289,19 +226,6 @@ async def startup_event():
             received_at TIMESTAMP DEFAULT now()
         )
         """)
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS minute_average (
-            id SERIAL PRIMARY KEY,
-            minute_start TIMESTAMP,
-            ax_g REAL, ay_g REAL, az_g REAL,
-            var_ax REAL, var_ay REAL, var_az REAL,
-            std_ax REAL, std_ay REAL, std_az REAL,
-            bpm REAL, var_bpm REAL, std_bpm REAL,
-            spo2_pct REAL, var_spo2 REAL, std_spo2 REAL
-        )
-        """)
-
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS idle_time (
             day DATE PRIMARY KEY,
@@ -310,7 +234,7 @@ async def startup_event():
         """)
 
     # Start background task
-    asyncio.create_task(minute_aggregator_task())
+    asyncio.create_task(per_second_aggregator_task())
 
 # -------------------------------
 # Run server
