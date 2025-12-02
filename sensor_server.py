@@ -101,6 +101,7 @@ async def upload_sensor_data(pkt: VitalPacket):
 
 @app.get("/data/latest")
 def get_latest():
+    logger.info("message")
     if latest is None:
         return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
     return {"received_at": latest_server_ts, "packet": latest.dict()}
@@ -275,6 +276,8 @@ async def per_minute_aggregation_task():
             az_mean, az_var, az_std = safe_stats(az_vals)
             bpm_mean, bpm_var, bpm_std = safe_stats(bpm_vals)
             spo2_mean, spo2_var, spo2_std = safe_stats(spo2_vals)
+            logger.info(f"[Minute Agg] running, history length = {len(history)}")
+            logger.info(f"[Minute Agg] packets in last minute = {len(last_minute_packets)}")
 
             # Insert or update the row
             await conn.execute(
