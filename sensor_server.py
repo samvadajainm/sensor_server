@@ -158,18 +158,23 @@ async def get_24h_graph():
         return JSONResponse({"message": "DB not initialized"}, status_code=500)
 
     async with pg_pool.acquire() as conn:
+        # Compute cutoff timestamp in epoch seconds
+        cutoff_epoch = time.time() - 24 * 3600  # 24 hours ago
+
+        # Fetch rows where minute_start >= cutoff_epoch
         rows = await conn.fetch(
             """
             SELECT minute_start, bpm AS mean_bpm, var_bpm
             FROM minute_average
-            WHERE minute_start >= NOW() - INTERVAL '24 hours'
+            WHERE extract(epoch from minute_start) >= $1
             ORDER BY minute_start ASC
-            """
+            """,
+            cutoff_epoch
         )
 
         data = []
         for r in rows:
-            ts = int(r["minute_start"].timestamp() * 1000)
+            ts = int(r["minute_start"].timestamp() * 1000)  # convert to ms
             mean_bpm = r["mean_bpm"]
             var_bpm = r["var_bpm"]
             data.append({
@@ -177,6 +182,7 @@ async def get_24h_graph():
                 "mean": mean_bpm,
                 "variance": var_bpm
             })
+            # Optional logging
             print(f"[24h Graph] ts={ts}, mean={mean_bpm}, var={var_bpm}")
 
         print(f"[24h Graph] Total points: {len(data)}")
