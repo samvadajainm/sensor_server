@@ -4,6 +4,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Deque, Optional, List
 from collections import deque
+from datetime import datetime, timezone
+from statistics import mean, variance, pstdev
 import time
 import asyncio
 import uvicorn
@@ -264,13 +266,17 @@ async def per_second_aggregator_task():
 # -------------------------------
 # Background task: per-minute BPM aggregation with variance
 # -------------------------------
+
 async def per_minute_aggregation_task():
+    """Aggregate last minute of packets and store in minute_average table."""
+    global history, pg_pool
+
     while True:
-        await asyncio.sleep(60)  # run every minute
         logger.info("[Minute Agg] Tick - starting aggregation cycle")
+        await asyncio.sleep(60)  # run every minute
 
         if pg_pool is None:
-            logger.info("[Minute Agg] pg_pool is None, skipping this cycle")
+            logger.warning("[Minute Agg] pg_pool is None, skipping cycle")
             continue
 
         if not history:
@@ -278,51 +284,51 @@ async def per_minute_aggregation_task():
             continue
 
         async with pg_pool.acquire() as conn:
-            now_ts = time.time()
-            one_min_ago_ts = now_ts - 60
-            logger.info(f"[Minute Agg] Current timestamp: {now_ts}, one_min_ago: {one_min_ago_ts}")
+            # Current server time in UTC
+            now_utc = datetime.now(timezone.utc)
+            one_min_ago_utc = now_utc - timedelta(seconds=60)
 
-            # Fetch packets within the last 60 seconds
-            last_minute_packets = [p for p in history if p.server_ts >= one_min_ago_ts]
-
-            logger.info(f"[Minute Agg] Found {len(last_minute_packets)} packets in last minute")
+            # Collect packets from the last minute based on server timestamp
+            last_minute_packets = [
+                p for p in history if one_min_ago_utc.timestamp() * 1000 <= p.ts_ms <= now_utc.timestamp() * 1000
+            ]
 
             if not last_minute_packets:
                 logger.info("[Minute Agg] No packets in last minute, skipping insert")
                 continue
 
+            logger.info(f"[Minute Agg] Found {len(last_minute_packets)} packets in last minute")
+
             # Helper function
             def safe_stats(values):
-                if len(values) == 0:
-                    logger.info("[Minute Agg] safe_stats called with empty values")
-                    return (None, None, None)
+                if not values:
+                    return None, None, None
                 if len(values) == 1:
-                    logger.info("[Minute Agg] safe_stats called with single value")
-                    return (values[0], 0.0, 0.0)
+                    return values[0], 0.0, 0.0
                 m = mean(values)
                 v = variance(values)
-                s = math.sqrt(v)
-                return (m, v, s)
+                s = pstdev(values)
+                return m, v, s
 
-            # Collect raw lists
+            # Collect values
             ax_vals = [p.ax_g for p in last_minute_packets]
             ay_vals = [p.ay_g for p in last_minute_packets]
             az_vals = [p.az_g for p in last_minute_packets]
             bpm_vals = [p.bpm for p in last_minute_packets if p.bpm is not None]
             spo2_vals = [p.spo2_pct for p in last_minute_packets if p.spo2_pct is not None]
 
-            logger.info(f"[Minute Agg] Values collected - AX:{len(ax_vals)}, AY:{len(ay_vals)}, AZ:{len(az_vals)}, BPM:{len(bpm_vals)}, SPO2:{len(spo2_vals)}")
-
-            # Compute full stats
+            # Compute statistics
             ax_mean, ax_var, ax_std = safe_stats(ax_vals)
             ay_mean, ay_var, ay_std = safe_stats(ay_vals)
             az_mean, az_var, az_std = safe_stats(az_vals)
             bpm_mean, bpm_var, bpm_std = safe_stats(bpm_vals)
             spo2_mean, spo2_var, spo2_std = safe_stats(spo2_vals)
 
-            logger.info(f"[Minute Agg] Computed statistics - AX({ax_mean},{ax_var},{ax_std}), AY({ay_mean},{ay_var},{ay_std}), AZ({az_mean},{az_var},{az_std}), BPM({bpm_mean},{bpm_var},{bpm_std}), SPO2({spo2_mean},{spo2_var},{spo2_std})")
+            logger.info(f"[Minute Agg] Computed statistics - AX({ax_mean},{ax_var},{ax_std}), "
+                        f"AY({ay_mean},{ay_var},{ay_std}), AZ({az_mean},{az_var},{az_std}), "
+                        f"BPM({bpm_mean},{bpm_var},{bpm_std}), SPO2({spo2_mean},{spo2_var},{spo2_std})")
 
-            # Insert or update the row
+            # Insert into DB using current UTC timestamp
             await conn.execute(
                 """
                 INSERT INTO minute_average (
@@ -335,13 +341,7 @@ async def per_minute_aggregation_task():
                     var_spo2, std_spo2
                 )
                 VALUES (
-                    to_timestamp($1),
-                    $2, $3, $4,
-                    $5, $6,
-                    $7, $8, $9,
-                    $10, $11, $12,
-                    $13, $14,
-                    $15, $16
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
                 )
                 ON CONFLICT (minute_start)
                 DO UPDATE SET
@@ -361,7 +361,7 @@ async def per_minute_aggregation_task():
                     var_spo2  = EXCLUDED.var_spo2,
                     std_spo2  = EXCLUDED.std_spo2
                 """,
-                int(one_min_ago_ts),
+                now_utc,  # minute_start
                 ax_mean, ay_mean, az_mean,
                 bpm_mean, spo2_mean,
                 ax_var, ay_var, az_var,
@@ -370,11 +370,8 @@ async def per_minute_aggregation_task():
                 spo2_var, spo2_std
             )
 
-            logger.info(
-                f"[Minute Aggregation] Inserted/Updated row - "
-                f"AX(avg)={ax_mean:.3f}, AY(avg)={ay_mean:.3f}, AZ(avg)={az_mean:.3f}, "
-                f"BPM(avg)={bpm_mean}, SPO2(avg)={spo2_mean}, packets={len(last_minute_packets)}"
-            )
+            logger.info("[Minute Agg] Inserted aggregated row into minute_average table")
+
 
 
 
