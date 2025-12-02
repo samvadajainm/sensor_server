@@ -155,6 +155,33 @@ def health():
 
 @app.get("/data/24h")
 async def get_24h_graph():
+    if pg_pool is None:
+        return JSONResponse({"message": "DB not initialized"}, status_code=500)
+
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT minute_start, bpm AS mean_bpm, var_bpm
+            FROM minute_average
+            WHERE minute_start >= NOW() - INTERVAL '24 hours'
+            ORDER BY minute_start ASC
+            """
+        )
+
+        data = []
+        for r in rows:
+            ts = int(r["minute_start"].timestamp() * 1000)
+            mean_bpm = r["mean_bpm"]
+            var_bpm = r["var_bpm"]
+            data.append({
+                "timestamp": ts,
+                "mean": mean_bpm,
+                "variance": var_bpm
+            })
+            logger.info(f"[24h Graph] ts={ts}, mean={mean_bpm}, var={var_bpm}")
+
+        logger.info(f"[24h Graph] Total points: {len(data)}")
+        return data
     """Return last 24 hours of minute averages including variance"""
     if pg_pool is None:
         return JSONResponse({"message": "DB not initialized"}, status_code=500)
@@ -268,67 +295,57 @@ async def per_second_aggregator_task():
 # -------------------------------
 
 async def per_minute_aggregation_task():
-    """Aggregate last minute of packets and store in minute_average table."""
-    global history, pg_pool
-
+    logger.info("[Minute Agg] Background task started")
     while True:
         logger.info("[Minute Agg] Tick - starting aggregation cycle")
         await asyncio.sleep(60)  # run every minute
 
         if pg_pool is None:
-            logger.warning("[Minute Agg] pg_pool is None, skipping cycle")
+            logger.info("[Minute Agg] pg_pool is not initialized, skipping")
             continue
 
         if not history:
             logger.info("[Minute Agg] history buffer is empty, skipping this cycle")
             continue
 
+        # Use server timestamp for minute
+        now_ts = time.time()
+        one_min_ago_ts = now_ts - 60
+
+        # Take all packets currently in history
+        last_minute_packets = history[:]
+        logger.info(f"[Minute Agg] Found {len(last_minute_packets)} packets in last minute")
+
+        # Collect raw values
+        ax_vals = [p.ax_g for p in last_minute_packets]
+        ay_vals = [p.ay_g for p in last_minute_packets]
+        az_vals = [p.az_g for p in last_minute_packets]
+        bpm_vals = [p.bpm for p in last_minute_packets if p.bpm is not None]
+        spo2_vals = [p.spo2_pct for p in last_minute_packets if p.spo2_pct is not None]
+
+        # Helper for mean, variance, std
+        def safe_stats(values):
+            if not values:
+                return (None, None, None)
+            if len(values) == 1:
+                return (values[0], 0.0, 0.0)
+            m = mean(values)
+            v = variance(values)
+            s = sqrt(v)
+            return (m, v, s)
+
+        ax_mean, ax_var, ax_std = safe_stats(ax_vals)
+        ay_mean, ay_var, ay_std = safe_stats(ay_vals)
+        az_mean, az_var, az_std = safe_stats(az_vals)
+        bpm_mean, bpm_var, bpm_std = safe_stats(bpm_vals)
+        spo2_mean, spo2_var, spo2_std = safe_stats(spo2_vals)
+
+        logger.info(f"[Minute Agg] Computed stats - AX({ax_mean},{ax_var},{ax_std}) "
+                    f"AY({ay_mean},{ay_var},{ay_std}) AZ({az_mean},{az_var},{az_std}) "
+                    f"BPM({bpm_mean},{bpm_var},{bpm_std}) SPO2({spo2_mean},{spo2_var},{spo2_std})")
+
+        # Insert into DB using server minute timestamp
         async with pg_pool.acquire() as conn:
-            # Current server time in UTC
-            now_utc = datetime.now(timezone.utc)
-            one_min_ago_utc = now_utc - timedelta(seconds=60)
-
-            # Collect packets from the last minute based on server timestamp
-            last_minute_packets = [
-                p for p in history if one_min_ago_utc.timestamp() * 1000 <= p.ts_ms <= now_utc.timestamp() * 1000
-            ]
-
-            if not last_minute_packets:
-                logger.info("[Minute Agg] No packets in last minute, skipping insert")
-                continue
-
-            logger.info(f"[Minute Agg] Found {len(last_minute_packets)} packets in last minute")
-
-            # Helper function
-            def safe_stats(values):
-                if not values:
-                    return None, None, None
-                if len(values) == 1:
-                    return values[0], 0.0, 0.0
-                m = mean(values)
-                v = variance(values)
-                s = pstdev(values)
-                return m, v, s
-
-            # Collect values
-            ax_vals = [p.ax_g for p in last_minute_packets]
-            ay_vals = [p.ay_g for p in last_minute_packets]
-            az_vals = [p.az_g for p in last_minute_packets]
-            bpm_vals = [p.bpm for p in last_minute_packets if p.bpm is not None]
-            spo2_vals = [p.spo2_pct for p in last_minute_packets if p.spo2_pct is not None]
-
-            # Compute statistics
-            ax_mean, ax_var, ax_std = safe_stats(ax_vals)
-            ay_mean, ay_var, ay_std = safe_stats(ay_vals)
-            az_mean, az_var, az_std = safe_stats(az_vals)
-            bpm_mean, bpm_var, bpm_std = safe_stats(bpm_vals)
-            spo2_mean, spo2_var, spo2_std = safe_stats(spo2_vals)
-
-            logger.info(f"[Minute Agg] Computed statistics - AX({ax_mean},{ax_var},{ax_std}), "
-                        f"AY({ay_mean},{ay_var},{ay_std}), AZ({az_mean},{az_var},{az_std}), "
-                        f"BPM({bpm_mean},{bpm_var},{bpm_std}), SPO2({spo2_mean},{spo2_var},{spo2_std})")
-
-            # Insert into DB using current UTC timestamp
             await conn.execute(
                 """
                 INSERT INTO minute_average (
@@ -341,7 +358,13 @@ async def per_minute_aggregation_task():
                     var_spo2, std_spo2
                 )
                 VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+                    to_timestamp($1),
+                    $2, $3, $4,
+                    $5, $6,
+                    $7, $8, $9,
+                    $10, $11, $12,
+                    $13, $14,
+                    $15, $16
                 )
                 ON CONFLICT (minute_start)
                 DO UPDATE SET
@@ -361,7 +384,7 @@ async def per_minute_aggregation_task():
                     var_spo2  = EXCLUDED.var_spo2,
                     std_spo2  = EXCLUDED.std_spo2
                 """,
-                now_utc,  # minute_start
+                int(now_ts),
                 ax_mean, ay_mean, az_mean,
                 bpm_mean, spo2_mean,
                 ax_var, ay_var, az_var,
@@ -370,10 +393,9 @@ async def per_minute_aggregation_task():
                 spo2_var, spo2_std
             )
 
-            logger.info("[Minute Agg] Inserted aggregated row into minute_average table")
-
-
-
+        # Clear history buffer after aggregation
+        history.clear()
+        logger.info("[Minute Agg] Aggregation done, history cleared")
 
 # -------------------------------
 # Startup
