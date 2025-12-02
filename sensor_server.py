@@ -64,7 +64,7 @@ pg_pool: Optional[asyncpg.pool.Pool] = None
 # -------------------------------
 @app.post("/upload")
 async def upload_sensor_data(pkt: VitalPacket):
-    global latest, latest_server_ts, second_buffer, second_start_time
+    global latest, latest_server_ts, second_buffer, second_start_time, minute_buffer
 
     latest = pkt
     latest_server_ts = time.time()
