@@ -18,8 +18,8 @@ import asyncpg
 # Setup
 # -------------------------------
 app = FastAPI(title="High-Frequency Sensor Server")
-logger = logging.getLogger("sensor_server")
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("sensor_server")
 
 # -------------------------------
 # Sensor data model
@@ -43,6 +43,7 @@ latest_server_ts: Optional[float] = None
 
 second_buffer: List[VitalPacket] = []
 second_start_time: Optional[float] = None
+minute_buffer: List[VitalPacket] = []
 idle_seconds_today: int = 0
 
 # -------------------------------
