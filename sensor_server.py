@@ -67,36 +67,55 @@ pg_pool: Optional[asyncpg.pool.Pool] = None
 async def upload_sensor_data(pkt: VitalPacket):
     global latest, latest_server_ts, second_buffer, second_start_time, minute_buffer
 
+    logger.info(f"[Upload] Received packet: {pkt}")
+
+    # Update latest packet and timestamp
     latest = pkt
     latest_server_ts = time.time()
     history.append(pkt)
+    logger.info(f"[Upload] Appended to history, history length={len(history)}")
 
     # Add to second buffer
     if second_start_time is None:
         second_start_time = time.time()
+        logger.info(f"[Upload] Initialized second_start_time={second_start_time}")
     second_buffer.append(pkt)
+    logger.info(f"[Upload] Added to second_buffer, length={len(second_buffer)}")
+
+    # Add to minute buffer
+    if 'minute_buffer' not in globals():
+        minute_buffer = []
+        logger.info(f"[Upload] Initialized minute_buffer")
     minute_buffer.append(pkt)
+    logger.info(f"[Upload] Added to minute_buffer, length={len(minute_buffer)}")
 
     # Forward to WebSocket clients
     disconnected = []
     for ws in connected_clients:
         try:
             await ws.send_json(pkt.dict())
-        except Exception:
+            logger.info(f"[Upload] Sent packet to WebSocket client")
+        except Exception as e:
+            logger.warning(f"[Upload] WebSocket send failed: {e}")
             disconnected.append(ws)
     for ws in disconnected:
         connected_clients.remove(ws)
+        logger.info(f"[Upload] Removed disconnected WebSocket client, remaining clients={len(connected_clients)}")
 
     # Store raw packet in DB
     if pg_pool:
         async with pg_pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO raw_packets (device_id, ts_ms, ax_g, ay_g, az_g, bpm, spo2_pct)
-                VALUES ($1,$2,$3,$4,$5,$6,$7)
-                """,
-                pkt.deviceId, pkt.ts_ms, pkt.ax_g, pkt.ay_g, pkt.az_g, pkt.bpm, pkt.spo2_pct
-            )
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO raw_packets (device_id, ts_ms, ax_g, ay_g, az_g, bpm, spo2_pct)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7)
+                    """,
+                    pkt.deviceId, pkt.ts_ms, pkt.ax_g, pkt.ay_g, pkt.az_g, pkt.bpm, pkt.spo2_pct
+                )
+                logger.info(f"[Upload] Inserted packet into DB")
+            except Exception as e:
+                logger.error(f"[Upload] Failed to insert packet into DB: {e}")
 
     return {"status": "ok", "count": len(history)}
 
