@@ -32,6 +32,7 @@ class VitalPacket(BaseModel):
     az_g: float
     bpm: int
     spo2_pct: float
+    server_ts: Optional[float] = None
 
 # -------------------------------
 # Buffers
