@@ -74,6 +74,7 @@ async def upload_sensor_data(pkt: VitalPacket):
     if second_start_time is None:
         second_start_time = time.time()
     second_buffer.append(pkt)
+    minute_buffer.append(pkt)
 
     # Forward to WebSocket clients
     disconnected = []
