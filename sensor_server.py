@@ -229,35 +229,108 @@ async def per_second_aggregator_task():
 
             logger.debug(f"[Idle] magnitude={magnitude:.3f}, idle_seconds_today={idle_seconds_today}")
 
-# -------------------------------
-# Background task: per-minute BPM aggregation with variance
-# -------------------------------
+# -----------------------------------------------------------
+# Background task: per-minute aggregation (ACC + BPM + SPO2)
+# -----------------------------------------------------------
 async def per_minute_aggregation_task():
     while True:
         await asyncio.sleep(60)  # run every minute
+
         if pg_pool is None or not history:
             continue
 
         async with pg_pool.acquire() as conn:
-            # Fetch last minute of data from memory
             now_ts = time.time()
             one_min_ago_ts = now_ts - 60
-            last_minute_packets = [p for p in history if p.ts_ms / 1000 >= one_min_ago_ts]
 
-            bpm_values = [p.bpm for p in last_minute_packets]
-            if bpm_values:
-                mean_bpm = mean(bpm_values)
-                var_bpm = variance(bpm_values) if len(bpm_values) > 1 else 0.0
+            # Fetch packets within the last 60 seconds
+            last_minute_packets = [
+                p for p in history if p.ts_ms / 1000 >= one_min_ago_ts
+            ]
 
-                await conn.execute(
-                    """
-                    INSERT INTO minute_average (minute_start, bpm, var_bpm)
-                    VALUES (to_timestamp($1), $2, $3)
-                    ON CONFLICT (minute_start) DO UPDATE SET bpm=$2, var_bpm=$3
-                    """,
-                    int(one_min_ago_ts), mean_bpm, var_bpm
+            if not last_minute_packets:
+                continue
+
+            # Helper function
+            def safe_stats(values):
+                if len(values) == 0:
+                    return (None, None, None)
+                if len(values) == 1:
+                    return (values[0], 0.0, 0.0)
+                m = mean(values)
+                v = variance(values)
+                s = sqrt(v)
+                return (m, v, s)
+
+            # Collect raw lists
+            ax_vals = [p.ax_g for p in last_minute_packets]
+            ay_vals = [p.ay_g for p in last_minute_packets]
+            az_vals = [p.az_g for p in last_minute_packets]
+            bpm_vals = [p.bpm for p in last_minute_packets if p.bpm is not None]
+            spo2_vals = [p.spo2_pct for p in last_minute_packets if p.spo2_pct is not None]
+
+            # Compute full stats
+            ax_mean, ax_var, ax_std = safe_stats(ax_vals)
+            ay_mean, ay_var, ay_std = safe_stats(ay_vals)
+            az_mean, az_var, az_std = safe_stats(az_vals)
+            bpm_mean, bpm_var, bpm_std = safe_stats(bpm_vals)
+            spo2_mean, spo2_var, spo2_std = safe_stats(spo2_vals)
+
+            # Insert or update the row
+            await conn.execute(
+                """
+                INSERT INTO minute_average (
+                    minute_start,
+                    ax_g, ay_g, az_g,
+                    bpm, spo2_pct,
+                    var_ax, var_ay, var_az,
+                    std_ax, std_ay, std_az,
+                    var_bpm, std_bpm,
+                    var_spo2, std_spo2
                 )
-                logger.info(f"[Minute Aggregate] mean={mean_bpm:.2f}, var={var_bpm:.2f}, count={len(bpm_values)}")
+                VALUES (
+                    to_timestamp($1),
+                    $2, $3, $4,
+                    $5, $6,
+                    $7, $8, $9,
+                    $10, $11, $12,
+                    $13, $14,
+                    $15, $16
+                )
+                ON CONFLICT (minute_start)
+                DO UPDATE SET
+                    ax_g      = EXCLUDED.ax_g,
+                    ay_g      = EXCLUDED.ay_g,
+                    az_g      = EXCLUDED.az_g,
+                    bpm       = EXCLUDED.bpm,
+                    spo2_pct  = EXCLUDED.spo2_pct,
+                    var_ax    = EXCLUDED.var_ax,
+                    var_ay    = EXCLUDED.var_ay,
+                    var_az    = EXCLUDED.var_az,
+                    std_ax    = EXCLUDED.std_ax,
+                    std_ay    = EXCLUDED.std_ay,
+                    std_az    = EXCLUDED.std_az,
+                    var_bpm   = EXCLUDED.var_bpm,
+                    std_bpm   = EXCLUDED.std_bpm,
+                    var_spo2  = EXCLUDED.var_spo2,
+                    std_spo2  = EXCLUDED.std_spo2
+                """,
+                int(one_min_ago_ts),
+                ax_mean, ay_mean, az_mean,
+                bpm_mean, spo2_mean,
+                ax_var, ay_var, az_var,
+                ax_std, ay_std, az_std,
+                bpm_var, bpm_std,
+                spo2_var, spo2_std
+            )
+
+            logger.info(
+                f"[Minute Aggregation] "
+                f"ACC(avg)=({ax_mean:.3f},{ay_mean:.3f},{az_mean:.3f}), "
+                f"BPM(avg)={bpm_mean}, SPO2(avg)={spo2_mean}, "
+                f"rows={len(last_minute_packets)}"
+            )
+
 
 # -------------------------------
 # Startup
