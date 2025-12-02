@@ -72,6 +72,7 @@ async def upload_sensor_data(pkt: VitalPacket):
     # Update latest packet and timestamp
     latest = pkt
     latest_server_ts = time.time()
+    pkt.server_ts = latest_server_ts 
     history.append(pkt)
     logger.info(f"[Upload] Appended to history, history length={len(history)}")
 
@@ -275,9 +276,8 @@ async def per_minute_aggregation_task():
             logger.info(f"[Minute Agg] Current timestamp: {now_ts}, one_min_ago: {one_min_ago_ts}")
 
             # Fetch packets within the last 60 seconds
-            last_minute_packets = [
-                p for p in history if p.ts_ms / 1000 >= one_min_ago_ts
-            ]
+            last_minute_packets = [p for p in history if p.server_ts >= one_min_ago_ts]
+
             logger.info(f"[Minute Agg] Found {len(last_minute_packets)} packets in last minute")
 
             if not last_minute_packets:
