@@ -310,6 +310,7 @@ async def per_minute_aggregation_task():
 
         # Use server timestamp for the minute
         now_ts = time.time()
+        logger.info(f"[Minute Agg] now_ts={now_ts} ({datetime.fromtimestamp(now_ts)})")
 
         # Copy packets from history
         last_minute_packets = list(history)
