@@ -49,6 +49,13 @@ second_start_time: Optional[float] = None
 minute_buffer: List[VitalPacket] = []
 idle_seconds_today: int = 0
 
+step_count_today: int = 0
+prev_magnitude: Optional[float] = None
+STEP_THRESHOLD = 1.2   # magnitude threshold for a step
+STEP_MIN_INTERVAL = 0.3  # minimum seconds between steps
+last_step_time: float = 0
+
+
 # -------------------------------
 # WebSocket clients
 # -------------------------------
@@ -149,6 +156,30 @@ async def get_idle_time():
         )
         idle_minutes = row["idle_minutes"] if row else 0
     return {"idle_minutes": idle_minutes}
+
+@app.get("/data/steps")
+async def get_step_count():
+    if pg_pool is None:
+        return JSONResponse({"message": "DB not initialized"}, status_code=500)
+    
+    # Optional: store daily step count in DB like idle_minutes
+    async with pg_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO daily_steps(day, step_count)
+            VALUES (CURRENT_DATE, $1)
+            ON CONFLICT (day) DO UPDATE SET step_count = $1
+            """,
+            step_count_today
+        )
+
+        row = await conn.fetchrow(
+            "SELECT step_count FROM daily_steps WHERE day = CURRENT_DATE"
+        )
+        steps = row["step_count"] if row else 0
+
+    return {"steps_today": steps}
+
 
 @app.get("/health")
 def health():
@@ -255,7 +286,7 @@ async def websocket_endpoint(ws: WebSocket):
 # Background task: per-second idle calculation
 # -------------------------------
 async def per_second_aggregator_task():
-    global second_buffer, second_start_time, idle_seconds_today
+    global second_buffer, second_start_time, idle_seconds_today, step_count_today, prev_magnitude, last_step_time
 
     while True:
         await asyncio.sleep(0.5)
@@ -286,6 +317,17 @@ async def per_second_aggregator_task():
                         idle_seconds_today // 60
                     )
 
+            current_time = time.time()
+
+            # Simple step detection: rising edge above threshold
+            if prev_magnitude is not None:
+                if prev_magnitude < STEP_THRESHOLD <= magnitude:
+                # Check minimum interval to avoid double counting
+                    if current_time - last_step_time >= STEP_MIN_INTERVAL:
+                        step_count_today += 1
+                        last_step_time = current_time
+                        logger.info(f"[Step] Step detected, total today={step_count_today}")
+            prev_magnitude = magnitude
             logger.debug(f"[Idle] magnitude={magnitude:.3f}, idle_seconds_today={idle_seconds_today}")
 
 # -----------------------------------------------------------
@@ -452,6 +494,13 @@ async def startup_event():
 
             var_spo2 REAL,
             std_spo2 REAL
+        );
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS daily_steps (
+            day DATE PRIMARY KEY,
+            step_count INT
         );
         """)
 
