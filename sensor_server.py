@@ -439,13 +439,6 @@ CREATE TABLE IF NOT EXISTS minute_average (
             idle_minutes INT
         )
         """)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS minute_average (
-            minute_start TIMESTAMP PRIMARY KEY,
-            bpm REAL,
-            var_bpm REAL
-        )
-        """)
 
     # Start background tasks
     asyncio.create_task(per_second_aggregator_task())
