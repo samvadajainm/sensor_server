@@ -454,6 +454,10 @@ async def startup_event():
         );
         """)
 
+    asyncio.create_task(per_second_aggregator_task())
+    asyncio.create_task(per_minute_aggregation_task())
+    logger.info("[Startup] Background tasks started")
+
 # -------------------------------
 # Run server
 # -------------------------------
