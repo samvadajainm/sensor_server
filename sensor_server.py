@@ -72,6 +72,7 @@ async def upload_sensor_data(pkt: VitalPacket):
 
     logger.info(f"[Upload] Received packet: {pkt}")
 
+    pkt.bpm = pkt.bpm / 2
     # Update latest packet and timestamp
     latest = pkt
     latest_server_ts = time.time()
