@@ -293,9 +293,9 @@ async def per_second_aggregator_task():
 # -------------------------------
 # Background task: per-minute BPM aggregation with variance
 # -------------------------------
-
 async def per_minute_aggregation_task():
     logger.info("[Minute Agg] Background task started")
+    
     while True:
         logger.info("[Minute Agg] Tick - starting aggregation cycle")
         await asyncio.sleep(60)  # run every minute
@@ -308,12 +308,11 @@ async def per_minute_aggregation_task():
             logger.info("[Minute Agg] history buffer is empty, skipping this cycle")
             continue
 
-        # Use server timestamp for minute
+        # Use server timestamp for the minute
         now_ts = time.time()
-        one_min_ago_ts = now_ts - 60
 
-        # Take all packets currently in history
-        last_minute_packets = history[:]
+        # Copy packets from history
+        last_minute_packets = list(history)
         logger.info(f"[Minute Agg] Found {len(last_minute_packets)} packets in last minute")
 
         # Collect raw values
@@ -323,16 +322,16 @@ async def per_minute_aggregation_task():
         bpm_vals = [p.bpm for p in last_minute_packets if p.bpm is not None]
         spo2_vals = [p.spo2_pct for p in last_minute_packets if p.spo2_pct is not None]
 
-        # Helper for mean, variance, std
+        # Helper: compute mean, variance, std; return None if empty
         def safe_stats(values):
             if not values:
-                return (None, None, None)
+                return None, None, None
             if len(values) == 1:
-                return (values[0], 0.0, 0.0)
+                return values[0], 0.0, 0.0
             m = mean(values)
             v = variance(values)
-            s = sqrt(v)
-            return (m, v, s)
+            s = math.sqrt(v)
+            return m, v, s
 
         ax_mean, ax_var, ax_std = safe_stats(ax_vals)
         ay_mean, ay_var, ay_std = safe_stats(ay_vals)
@@ -344,7 +343,7 @@ async def per_minute_aggregation_task():
                     f"AY({ay_mean},{ay_var},{ay_std}) AZ({az_mean},{az_var},{az_std}) "
                     f"BPM({bpm_mean},{bpm_var},{bpm_std}) SPO2({spo2_mean},{spo2_var},{spo2_std})")
 
-        # Insert into DB using server minute timestamp
+        # Insert into DB safely
         async with pg_pool.acquire() as conn:
             await conn.execute(
                 """
@@ -384,7 +383,7 @@ async def per_minute_aggregation_task():
                     var_spo2  = EXCLUDED.var_spo2,
                     std_spo2  = EXCLUDED.std_spo2
                 """,
-                int(now_ts),
+                float(now_ts),   # timestamp in seconds
                 ax_mean, ay_mean, az_mean,
                 bpm_mean, spo2_mean,
                 ax_var, ay_var, az_var,
@@ -393,7 +392,7 @@ async def per_minute_aggregation_task():
                 spo2_var, spo2_std
             )
 
-        # Clear history buffer after aggregation
+        # Clear history after aggregation
         history.clear()
         logger.info("[Minute Agg] Aggregation done, history cleared")
 
