@@ -293,42 +293,42 @@ async def per_second_aggregator_task():
         if second_start_time is None or len(second_buffer) == 0:
             continue
 
-        elapsed = time.time() - second_start_time
-        if elapsed >= 1.0:
-            avg_ax = mean([p.ax_g for p in second_buffer])
-            avg_ay = mean([p.ay_g for p in second_buffer])
-            avg_az = mean([p.az_g for p in second_buffer])
+        # elapsed = time.time() - second_start_time
+        # if elapsed >= 1.0:
+        avg_ax = mean([p.ax_g for p in second_buffer])
+        avg_ay = mean([p.ay_g for p in second_buffer])
+        avg_az = mean([p.az_g for p in second_buffer])
 
-            magnitude = math.sqrt(avg_ax**2 + avg_ay**2 + (avg_az - 1)**2)
-            if magnitude < 0.55:
-                idle_seconds_today += 1
+        magnitude = math.sqrt(avg_ax**2 + avg_ay**2 + (avg_az - 1)**2)
+        if magnitude < 0.55:
+            idle_seconds_today += 1
 
-            second_buffer = []
-            second_start_time = time.time()
+        second_buffer = []
+        second_start_time = time.time()
 
-            if idle_seconds_today % 60 == 0 and pg_pool:
-                async with pg_pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        INSERT INTO idle_time(day, idle_minutes)
-                        VALUES (CURRENT_DATE, $1)
-                        ON CONFLICT (day) DO UPDATE SET idle_minutes = $1
-                        """,
-                        idle_seconds_today // 60
-                    )
+        if idle_seconds_today % 60 == 0 and pg_pool:
+            async with pg_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO idle_time(day, idle_minutes)
+                    VALUES (CURRENT_DATE, $1)
+                    ON CONFLICT (day) DO UPDATE SET idle_minutes = $1
+                    """,
+                    idle_seconds_today // 60
+                )
 
-            current_time = time.time()
+        current_time = time.time()
 
-            # Simple step detection: rising edge above threshold
-            if prev_magnitude is not None:
-                if prev_magnitude < STEP_THRESHOLD <= magnitude:
+        # Simple step detection: rising edge above threshold
+        if prev_magnitude is not None:
+            if prev_magnitude < STEP_THRESHOLD <= magnitude:
                 # Check minimum interval to avoid double counting
-                    if current_time - last_step_time >= STEP_MIN_INTERVAL:
-                        step_count_today += 1
-                        last_step_time = current_time
-                        logger.info(f"[Step] Step detected, total today={step_count_today}")
-            prev_magnitude = magnitude
-            logger.debug(f"[Idle] magnitude={magnitude:.3f}, idle_seconds_today={idle_seconds_today}")
+                if current_time - last_step_time >= STEP_MIN_INTERVAL:
+                    step_count_today += 1
+                    last_step_time = current_time
+                    logger.info(f"[Step] Step detected, total today={step_count_today}")
+        prev_magnitude = magnitude
+        logger.debug(f"[Idle] magnitude={magnitude:.3f}, idle_seconds_today={idle_seconds_today}")
 
 # -----------------------------------------------------------
 # Background task: per-minute aggregation (ACC + BPM + SPO2)
