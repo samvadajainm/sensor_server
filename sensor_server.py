@@ -407,42 +407,52 @@ async def startup_event():
     logger.info("PostgreSQL connection pool created")
 
     async with pg_pool.acquire() as conn:
-        # Create tables if missing
+
         await conn.execute("""
-CREATE TABLE IF NOT EXISTS minute_average (
-    minute_start TIMESTAMP PRIMARY KEY,
-
-    ax_g REAL,
-    ay_g REAL,
-    az_g REAL,
-    bpm REAL,
-    spo2_pct REAL,
-
-    var_ax REAL,
-    var_ay REAL,
-    var_az REAL,
-    std_ax REAL,
-    std_ay REAL,
-    std_az REAL,
-
-    var_bpm REAL,
-    std_bpm REAL,
-
-    var_spo2 REAL,
-    std_spo2 REAL
-)
-""")
+        CREATE TABLE IF NOT EXISTS raw_packets (
+            id SERIAL PRIMARY KEY,
+            device_id TEXT,
+            ts_ms BIGINT,
+            ax_g REAL,
+            ay_g REAL,
+            az_g REAL,
+            bpm INT,
+            spo2_pct REAL,
+            received_at TIMESTAMP DEFAULT now()
+        );
+        """)
 
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS idle_time (
             day DATE PRIMARY KEY,
             idle_minutes INT
-        )
+        );
         """)
 
-    # Start background tasks
-    asyncio.create_task(per_second_aggregator_task())
-    asyncio.create_task(per_minute_aggregation_task())
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS minute_average (
+            minute_start TIMESTAMP PRIMARY KEY,
+
+            ax_g REAL,
+            ay_g REAL,
+            az_g REAL,
+            bpm REAL,
+            spo2_pct REAL,
+
+            var_ax REAL,
+            var_ay REAL,
+            var_az REAL,
+            std_ax REAL,
+            std_ay REAL,
+            std_az REAL,
+
+            var_bpm REAL,
+            std_bpm REAL,
+
+            var_spo2 REAL,
+            std_spo2 REAL
+        );
+        """)
 
 # -------------------------------
 # Run server
