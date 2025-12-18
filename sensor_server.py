@@ -143,11 +143,8 @@ def get_recent(limit: int = 100):
     if not history:
         return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
     limit = max(1, min(limit, len(history)))
-    return [
-    p.dict()
-    for p in list(history)[-limit:]
-    if p.bpm is not None
-]
+    # Return raw packets exactly as received from sensor
+    return [p.dict() for p in list(history)[-limit:]]
 
 
 @app.get("/data/idle_time")
