@@ -77,42 +77,36 @@ pg_pool: Optional[asyncpg.pool.Pool] = None
 async def upload_sensor_data(pkt: VitalPacket):
     global latest, latest_server_ts, second_buffer, second_start_time, minute_buffer
 
-    logger.info(f"[Upload] Received packet: {pkt}")
+    raw_bpm = pkt.bpm
+    scaled_bpm = raw_bpm / 2
 
-    pkt.bpm = pkt.bpm / 2
     # Update latest packet and timestamp
     latest = pkt
     latest_server_ts = time.time()
     pkt.server_ts = latest_server_ts 
+    if pkt.bpm == 0:
+        pkt.bpm = None
     history.append(pkt)
-    logger.info(f"[Upload] Appended to history, history length={len(history)}")
 
     # Add to second buffer
     if second_start_time is None:
         second_start_time = time.time()
-        logger.info(f"[Upload] Initialized second_start_time={second_start_time}")
     second_buffer.append(pkt)
-    logger.info(f"[Upload] Added to second_buffer, length={len(second_buffer)}")
 
     # Add to minute buffer
     if 'minute_buffer' not in globals():
         minute_buffer = []
-        logger.info(f"[Upload] Initialized minute_buffer")
     minute_buffer.append(pkt)
-    logger.info(f"[Upload] Added to minute_buffer, length={len(minute_buffer)}")
 
     # Forward to WebSocket clients
     disconnected = []
     for ws in connected_clients:
         try:
             await ws.send_json(pkt.dict())
-            logger.info(f"[Upload] Sent packet to WebSocket client")
         except Exception as e:
-            logger.warning(f"[Upload] WebSocket send failed: {e}")
             disconnected.append(ws)
     for ws in disconnected:
         connected_clients.remove(ws)
-        logger.info(f"[Upload] Removed disconnected WebSocket client, remaining clients={len(connected_clients)}")
 
     # Store raw packet in DB
     if pg_pool:
@@ -125,7 +119,6 @@ async def upload_sensor_data(pkt: VitalPacket):
                     """,
                     pkt.deviceId, pkt.ts_ms, pkt.ax_g, pkt.ay_g, pkt.az_g, pkt.bpm, pkt.spo2_pct
                 )
-                logger.info(f"[Upload] Inserted packet into DB")
             except Exception as e:
                 logger.error(f"[Upload] Failed to insert packet into DB: {e}")
 
@@ -133,7 +126,6 @@ async def upload_sensor_data(pkt: VitalPacket):
 
 @app.get("/data/latest")
 def get_latest():
-    logger.info("message")
     if latest is None:
         return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
     return {"received_at": latest_server_ts, "packet": latest.dict()}
@@ -143,7 +135,12 @@ def get_recent(limit: int = 100):
     if not history:
         return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
     limit = max(1, min(limit, len(history)))
-    return [p.dict() for p in list(history)[-limit:]]
+    return [
+    p.dict()
+    for p in list(history)[-limit:]
+    if p.bpm is not None
+]
+
 
 @app.get("/data/idle_time")
 async def get_idle_time():
@@ -210,9 +207,7 @@ async def get_24h_graph():
                 "mean": mean_bpm,
                 "variance": var_bpm
             })
-            logger.info(f"[24h Graph] ts={ts}, mean={mean_bpm}, var={var_bpm}")
 
-        logger.info(f"[24h Graph] Total points: {len(data)}")
         return data
     """Return last 24 hours of minute averages including variance"""
     if pg_pool is None:
@@ -243,10 +238,6 @@ async def get_24h_graph():
                 "mean": mean_bpm,
                 "variance": var_bpm
             })
-            # Optional logging
-            print(f"[24h Graph] ts={ts}, mean={mean_bpm}, var={var_bpm}")
-
-        print(f"[24h Graph] Total points: {len(data)}")
         return data
 
 # -------------------------------
@@ -326,44 +317,37 @@ async def per_second_aggregator_task():
                 if current_time - last_step_time >= STEP_MIN_INTERVAL:
                     step_count_today += 1
                     last_step_time = current_time
-                    logger.info(f"[Step] Step detected, total today={step_count_today}")
         prev_magnitude = magnitude
-        logger.debug(f"[Idle] magnitude={magnitude:.3f}, idle_seconds_today={idle_seconds_today}")
 
-# -----------------------------------------------------------
-# Background task: per-minute aggregation (ACC + BPM + SPO2)
-# -----------------------------------------------------------
 # -------------------------------
 # Background task: per-minute BPM aggregation with variance
 # -------------------------------
 async def per_minute_aggregation_task():
-    logger.info("[Minute Agg] Background task started")
     
     while True:
-        logger.info("[Minute Agg] Tick - starting aggregation cycle")
         await asyncio.sleep(60)  # run every minute
 
         if pg_pool is None:
-            logger.info("[Minute Agg] pg_pool is not initialized, skipping")
             continue
 
         if not history:
-            logger.info("[Minute Agg] history buffer is empty, skipping this cycle")
             continue
 
         # Use server timestamp for the minute
         now_ts = time.time()
-        logger.info(f"[Minute Agg] now_ts={now_ts} ({datetime.fromtimestamp(now_ts)})")
 
         # Copy packets from history
         last_minute_packets = list(history)
-        logger.info(f"[Minute Agg] Found {len(last_minute_packets)} packets in last minute")
 
         # Collect raw values
         ax_vals = [p.ax_g for p in last_minute_packets]
         ay_vals = [p.ay_g for p in last_minute_packets]
         az_vals = [p.az_g for p in last_minute_packets]
-        bpm_vals = [p.bpm for p in last_minute_packets if p.bpm is not None]
+        bpm_vals = [
+    p.bpm for p in last_minute_packets
+    if p.bpm is not None and p.bpm > 0
+]
+
         spo2_vals = [p.spo2_pct for p in last_minute_packets if p.spo2_pct is not None]
 
         # Helper: compute mean, variance, std; return None if empty
@@ -382,10 +366,6 @@ async def per_minute_aggregation_task():
         az_mean, az_var, az_std = safe_stats(az_vals)
         bpm_mean, bpm_var, bpm_std = safe_stats(bpm_vals)
         spo2_mean, spo2_var, spo2_std = safe_stats(spo2_vals)
-
-        logger.info(f"[Minute Agg] Computed stats - AX({ax_mean},{ax_var},{ax_std}) "
-                    f"AY({ay_mean},{ay_var},{ay_std}) AZ({az_mean},{az_var},{az_std}) "
-                    f"BPM({bpm_mean},{bpm_var},{bpm_std}) SPO2({spo2_mean},{spo2_var},{spo2_std})")
 
         # Insert into DB safely
         async with pg_pool.acquire() as conn:
@@ -438,7 +418,6 @@ async def per_minute_aggregation_task():
 
         # Clear history after aggregation
         history.clear()
-        logger.info("[Minute Agg] Aggregation done, history cleared")
 
 # -------------------------------
 # Startup
@@ -447,7 +426,6 @@ async def per_minute_aggregation_task():
 async def startup_event():
     global pg_pool
     pg_pool = await asyncpg.create_pool(dsn=POSTGRES_DSN, min_size=1, max_size=5)
-    logger.info("PostgreSQL connection pool created")
 
     async with pg_pool.acquire() as conn:
 
@@ -506,7 +484,6 @@ async def startup_event():
 
     asyncio.create_task(per_second_aggregator_task())
     asyncio.create_task(per_minute_aggregation_task())
-    logger.info("[Startup] Background tasks started")
 
 # -------------------------------
 # Run server
