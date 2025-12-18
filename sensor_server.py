@@ -77,15 +77,12 @@ pg_pool: Optional[asyncpg.pool.Pool] = None
 async def upload_sensor_data(pkt: VitalPacket):
     global latest, latest_server_ts, second_buffer, second_start_time, minute_buffer
 
-    raw_bpm = pkt.bpm
-    scaled_bpm = raw_bpm / 2
-
     # Update latest packet and timestamp
     latest = pkt
     latest_server_ts = time.time()
-    pkt.server_ts = latest_server_ts 
-    if pkt.bpm == 0:
-        pkt.bpm = None
+    pkt.server_ts = latest_server_ts
+
+    # Store raw packet in history as-is (do not modify 0)
     history.append(pkt)
 
     # Add to second buffer
@@ -98,17 +95,22 @@ async def upload_sensor_data(pkt: VitalPacket):
         minute_buffer = []
     minute_buffer.append(pkt)
 
+    # Prepare a copy for DB / WS with scaled BPM if BPM > 0
+    pkt_to_store = pkt.dict()
+    if pkt.bpm and pkt.bpm > 0:
+        pkt_to_store['bpm'] = pkt.bpm / 2
+
     # Forward to WebSocket clients
     disconnected = []
     for ws in connected_clients:
         try:
-            await ws.send_json(pkt.dict())
+            await ws.send_json(pkt_to_store)
         except Exception as e:
             disconnected.append(ws)
     for ws in disconnected:
         connected_clients.remove(ws)
 
-    # Store raw packet in DB
+    # Store raw packet in DB with scaled BPM if >0
     if pg_pool:
         async with pg_pool.acquire() as conn:
             try:
@@ -117,7 +119,13 @@ async def upload_sensor_data(pkt: VitalPacket):
                     INSERT INTO raw_packets (device_id, ts_ms, ax_g, ay_g, az_g, bpm, spo2_pct)
                     VALUES ($1,$2,$3,$4,$5,$6,$7)
                     """,
-                    pkt.deviceId, pkt.ts_ms, pkt.ax_g, pkt.ay_g, pkt.az_g, pkt.bpm, pkt.spo2_pct
+                    pkt_to_store['deviceId'],
+                    pkt_to_store['ts_ms'],
+                    pkt_to_store['ax_g'],
+                    pkt_to_store['ay_g'],
+                    pkt_to_store['az_g'],
+                    pkt_to_store['bpm'],
+                    pkt_to_store['spo2_pct']
                 )
             except Exception as e:
                 logger.error(f"[Upload] Failed to insert packet into DB: {e}")
