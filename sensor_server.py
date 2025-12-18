@@ -422,7 +422,7 @@ async def per_minute_aggregation_task():
             )
 
         # Clear history after aggregation
-        history.clear()
+        # history.clear()
 
 # -------------------------------
 # Startup
