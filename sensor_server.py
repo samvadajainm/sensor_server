@@ -17,7 +17,7 @@ from pydantic import BaseModel
 # -------------------------------
 app = FastAPI(title="Heart Rate & SpO2 Server")
 
-# Allow CORS for WebSocket + API (replace "*" with your frontend/android domain in production)
+# Allow CORS (replace "*" with your frontend/android domain in production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,16 +39,19 @@ class VitalPacket(BaseModel):
     ax_g: float
     ay_g: float
     az_g: float
+    ir_raw: int
+    finger: int
     bpm: int
     spo2_pct: float
 
 # -------------------------------
-# Buffers
+# Buffers & latest packet
 # -------------------------------
 N_BUFFER = 10_000
 history: Deque[VitalPacket] = deque(maxlen=N_BUFFER)
 latest: Optional[VitalPacket] = None
 latest_server_ts: Optional[float] = None
+last_finger: Optional[int] = None  # New: last finger value
 
 second_buffer: List[VitalPacket] = []
 second_start_time: Optional[float] = None
@@ -65,13 +68,15 @@ connected_clients: List[WebSocket] = []
 @app.post("/upload")
 async def upload_sensor_data(pkt: VitalPacket):
     """Receive a single sensor packet and store it in memory"""
-    global latest, latest_server_ts, second_buffer, second_start_time
+    global latest, latest_server_ts, second_buffer, second_start_time, last_finger
 
     try:
         latest = pkt
         latest_server_ts = time.time()
+        last_finger = pkt.finger
         history.append(pkt)
-        logger.info(f"Received packet: {pkt.deviceId} bpm={pkt.bpm} spo2={pkt.spo2_pct}")
+
+        logger.info(f"Received packet: {pkt.deviceId} bpm={pkt.bpm} spo2={pkt.spo2_pct} finger={pkt.finger}")
 
         # Add to per-second buffer
         if second_start_time is None:
@@ -102,7 +107,11 @@ def get_latest():
         if latest is None:
             logger.info("No latest packet available")
             return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
-        return {"received_at": latest_server_ts, "packet": latest.dict()}
+        return {
+            "received_at": latest_server_ts,
+            "packet": latest.dict(),
+            "last_finger": last_finger
+        }
     except Exception as e:
         logger.error(f"Error in /data/latest: {e}")
         return JSONResponse({"message": str(e)}, status_code=500)
