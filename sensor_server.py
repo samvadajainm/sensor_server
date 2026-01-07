@@ -1,5 +1,4 @@
 # sensor_server.py
-import os
 import time
 import math
 import asyncio
@@ -8,8 +7,6 @@ from typing import Deque, Optional, List
 from collections import deque
 from statistics import mean
 
-import asyncpg
-import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,21 +60,11 @@ idle_seconds_today: int = 0
 connected_clients: List[WebSocket] = []
 
 # -------------------------------
-# PostgreSQL config
-# -------------------------------
-POSTGRES_DSN = os.getenv("DATABASE_URL")
-if not POSTGRES_DSN:
-    logger.error("DATABASE_URL is not set in environment")
-    raise RuntimeError("DATABASE_URL is not set in environment")
-
-pg_pool: Optional[asyncpg.pool.Pool] = None
-
-# -------------------------------
 # HTTP Endpoints
 # -------------------------------
 @app.post("/upload")
 async def upload_sensor_data(pkt: VitalPacket):
-    """Receive a single sensor packet and store it in memory & DB"""
+    """Receive a single sensor packet and store it in memory"""
     global latest, latest_server_ts, second_buffer, second_start_time
 
     try:
@@ -102,20 +89,6 @@ async def upload_sensor_data(pkt: VitalPacket):
         for ws in disconnected:
             connected_clients.remove(ws)
 
-        # Store in DB
-        if pg_pool:
-            try:
-                async with pg_pool.acquire() as conn:
-                    await conn.execute(
-                        """
-                        INSERT INTO raw_packets (device_id, ts_ms, ax_g, ay_g, az_g, bpm, spo2_pct)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7)
-                        """,
-                        pkt.deviceId, pkt.ts_ms, pkt.ax_g, pkt.ay_g, pkt.az_g, pkt.bpm, pkt.spo2_pct
-                    )
-            except Exception as e:
-                logger.error(f"Failed to store packet in DB: {e}")
-
         return {"status": "ok", "count": len(history)}
 
     except Exception as e:
@@ -132,6 +105,27 @@ def get_latest():
         return {"received_at": latest_server_ts, "packet": latest.dict()}
     except Exception as e:
         logger.error(f"Error in /data/latest: {e}")
+        return JSONResponse({"message": str(e)}, status_code=500)
+
+@app.get("/data/recent")
+def get_recent(limit: int = 100):
+    """Return recent N packets"""
+    try:
+        if not history:
+            return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
+        limit = max(1, min(limit, len(history)))
+        return [p.dict() for p in list(history)[-limit:]]
+    except Exception as e:
+        logger.error(f"Error in /data/recent: {e}")
+        return JSONResponse({"message": str(e)}, status_code=500)
+
+@app.get("/health")
+def health():
+    """Simple health check"""
+    try:
+        return {"ok": True, "buffer_size": len(history)}
+    except Exception as e:
+        logger.error(f"Error in /health: {e}")
         return JSONResponse({"message": str(e)}, status_code=500)
 
 # -------------------------------
@@ -157,7 +151,7 @@ async def websocket_endpoint(ws: WebSocket):
         await ws.close()
 
 # -------------------------------
-# Background per-second aggregator (optional, for idle detection)
+# Background per-second aggregator (optional for idle detection)
 # -------------------------------
 async def per_second_aggregator_task():
     global second_buffer, second_start_time, idle_seconds_today
@@ -182,17 +176,6 @@ async def per_second_aggregator_task():
                 second_buffer = []
                 second_start_time = time.time()
 
-                # Update DB every 60 seconds
-                if idle_seconds_today % 60 == 0 and pg_pool:
-                    async with pg_pool.acquire() as conn:
-                        await conn.execute(
-                            """
-                            INSERT INTO idle_time(day, idle_minutes)
-                            VALUES (CURRENT_DATE, $1)
-                            ON CONFLICT (day) DO UPDATE SET idle_minutes = $1
-                            """,
-                            idle_seconds_today // 60
-                        )
                 logger.debug(f"[Idle] magnitude={magnitude:.3f}, idle_seconds_today={idle_seconds_today}")
 
         except Exception as e:
@@ -203,43 +186,14 @@ async def per_second_aggregator_task():
 # -------------------------------
 @app.on_event("startup")
 async def startup_event():
-    global pg_pool
-    try:
-        pg_pool = await asyncpg.create_pool(dsn=POSTGRES_DSN, min_size=1, max_size=5)
-        logger.info("PostgreSQL connection pool created")
-
-        async with pg_pool.acquire() as conn:
-            # Create tables if missing
-            await conn.execute("""
-            CREATE TABLE IF NOT EXISTS raw_packets (
-                id SERIAL PRIMARY KEY,
-                device_id TEXT,
-                ts_ms BIGINT,
-                ax_g REAL,
-                ay_g REAL,
-                az_g REAL,
-                bpm INT,
-                spo2_pct REAL,
-                received_at TIMESTAMP DEFAULT now()
-            )
-            """)
-            await conn.execute("""
-            CREATE TABLE IF NOT EXISTS idle_time (
-                day DATE PRIMARY KEY,
-                idle_minutes INT
-            )
-            """)
-        # Start background aggregator
-        asyncio.create_task(per_second_aggregator_task())
-        logger.info("Background per-second aggregator started")
-    except Exception as e:
-        logger.error(f"Startup error: {e}")
-        raise
+    asyncio.create_task(per_second_aggregator_task())
+    logger.info("Background per-second aggregator started")
 
 # -------------------------------
 # Run server
 # -------------------------------
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 8000))
     logger.info(f"Starting server on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
