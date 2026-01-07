@@ -7,18 +7,27 @@ import logging
 from typing import Deque, Optional, List
 from collections import deque
 from statistics import mean
-from datetime import datetime
 
 import asyncpg
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # -------------------------------
 # Setup
 # -------------------------------
-app = FastAPI(title="High-Frequency Sensor Server")
+app = FastAPI(title="Heart Rate & SpO2 Server")
+
+# Allow CORS for WebSocket + API (replace "*" with your frontend/android domain in production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Logging
 logger = logging.getLogger("sensor_server")
@@ -68,20 +77,21 @@ pg_pool: Optional[asyncpg.pool.Pool] = None
 # -------------------------------
 @app.post("/upload")
 async def upload_sensor_data(pkt: VitalPacket):
+    """Receive a single sensor packet and store it in memory & DB"""
     global latest, latest_server_ts, second_buffer, second_start_time
 
     try:
         latest = pkt
         latest_server_ts = time.time()
         history.append(pkt)
-        logger.debug(f"Received packet: {pkt.dict()}")
+        logger.info(f"Received packet: {pkt.deviceId} bpm={pkt.bpm} spo2={pkt.spo2_pct}")
 
         # Add to per-second buffer
         if second_start_time is None:
             second_start_time = time.time()
         second_buffer.append(pkt)
 
-        # Forward to WebSocket clients
+        # Broadcast to WebSocket clients
         disconnected = []
         for ws in connected_clients:
             try:
@@ -103,7 +113,6 @@ async def upload_sensor_data(pkt: VitalPacket):
                         """,
                         pkt.deviceId, pkt.ts_ms, pkt.ax_g, pkt.ay_g, pkt.az_g, pkt.bpm, pkt.spo2_pct
                     )
-                    logger.debug(f"Packet stored in DB: {pkt.deviceId} at {pkt.ts_ms}")
             except Exception as e:
                 logger.error(f"Failed to store packet in DB: {e}")
 
@@ -115,6 +124,7 @@ async def upload_sensor_data(pkt: VitalPacket):
 
 @app.get("/data/latest")
 def get_latest():
+    """Get the latest packet"""
     try:
         if latest is None:
             logger.info("No latest packet available")
@@ -124,97 +134,15 @@ def get_latest():
         logger.error(f"Error in /data/latest: {e}")
         return JSONResponse({"message": str(e)}, status_code=500)
 
-@app.get("/data/recent")
-def get_recent(limit: int = 100):
-    try:
-        if not history:
-            logger.info("No recent data available")
-            return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
-        limit = max(1, min(limit, len(history)))
-        return [p.dict() for p in list(history)[-limit:]]
-    except Exception as e:
-        logger.error(f"Error in /data/recent: {e}")
-        return JSONResponse({"message": str(e)}, status_code=500)
-
-@app.get("/data/idle_time")
-async def get_idle_time():
-    try:
-        if pg_pool is None:
-            logger.error("DB pool not initialized for idle_time")
-            return JSONResponse({"message": "DB not initialized"}, status_code=500)
-        async with pg_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT idle_minutes FROM idle_time WHERE day = CURRENT_DATE"
-            )
-            idle_minutes = row["idle_minutes"] if row else 0
-            logger.debug(f"Idle minutes fetched: {idle_minutes}")
-        return {"idle_minutes": idle_minutes}
-    except Exception as e:
-        logger.error(f"Error in /data/idle_time: {e}")
-        return JSONResponse({"message": str(e)}, status_code=500)
-
-@app.get("/health")
-def health():
-    try:
-        return {"ok": True, "buffer_size": len(history)}
-    except Exception as e:
-        logger.error(f"Error in /health: {e}")
-        return JSONResponse({"message": str(e)}, status_code=500)
-
-@app.get("/data/24h")
-async def get_24h_graph():
-    try:
-        if pg_pool is None:
-            logger.error("DB pool not initialized for 24h graph")
-            return JSONResponse({"message": "DB not initialized"}, status_code=500)
-        async with pg_pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT minute_start, bpm AS mean_bpm, var_bpm
-                FROM minute_average
-                WHERE minute_start >= NOW() - INTERVAL '24 hours'
-                ORDER BY minute_start ASC
-                """
-            )
-            data = []
-            for r in rows:
-                ts = int(r["minute_start"].timestamp() * 1000)
-                data.append({
-                    "timestamp": ts,
-                    "mean_bpm": r["mean_bpm"],
-                    "var_bpm": r["var_bpm"]
-                })
-            logger.info(f"[24h Graph] Total points: {len(data)}")
-        return data
-    except Exception as e:
-        logger.error(f"Error in /data/24h: {e}")
-        return JSONResponse({"message": str(e)}, status_code=500)
-
 # -------------------------------
 # WebSocket endpoint
 # -------------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    """Real-time data push to clients (Android app)"""
     await ws.accept()
     connected_clients.append(ws)
     logger.info("WebSocket client connected")
-
-    async def send_idle_time_periodically():
-        while True:
-            try:
-                if pg_pool:
-                    async with pg_pool.acquire() as conn:
-                        row = await conn.fetchrow(
-                            "SELECT idle_minutes FROM idle_time WHERE day = CURRENT_DATE"
-                        )
-                        idle_minutes = row["idle_minutes"] if row else 0
-                        await ws.send_json({"type": "idle_time", "idle_minutes": idle_minutes})
-                await asyncio.sleep(60)
-            except Exception as e:
-                logger.warning(f"WebSocket idle_time periodic error: {e}")
-                break
-
-    asyncio.create_task(send_idle_time_periodically())
 
     try:
         while True:
@@ -229,7 +157,7 @@ async def websocket_endpoint(ws: WebSocket):
         await ws.close()
 
 # -------------------------------
-# Background per-second aggregator
+# Background per-second aggregator (optional, for idle detection)
 # -------------------------------
 async def per_second_aggregator_task():
     global second_buffer, second_start_time, idle_seconds_today
@@ -301,6 +229,7 @@ async def startup_event():
                 idle_minutes INT
             )
             """)
+        # Start background aggregator
         asyncio.create_task(per_second_aggregator_task())
         logger.info("Background per-second aggregator started")
     except Exception as e:
