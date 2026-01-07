@@ -53,10 +53,11 @@ connected_clients: List[WebSocket] = []
 # -------------------------------
 # PostgreSQL config
 # -------------------------------
-POSTGRES_DSN = os.getenv(
-    "DATABASE_URL",
-    "postgresql://sensordata_twcy_user:QMpGEMAS0nfjTgOAvOmP0qnDGPZajLIV@localhost/sensordata_twcy"
-)
+POSTGRES_DSN = os.getenv("DATABASE_URL")
+
+if not POSTGRES_DSN:
+    raise RuntimeError("DATABASE_URL is not set in environment")
+
 pg_pool: Optional[asyncpg.pool.Pool] = None
 
 # -------------------------------
@@ -274,4 +275,5 @@ async def startup_event():
 # Run server
 # -------------------------------
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
