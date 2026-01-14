@@ -1,6 +1,7 @@
 # sensor_server.py
 import time
 import math
+import os
 import asyncio
 import logging
 from typing import Deque, Optional, List
@@ -51,7 +52,7 @@ N_BUFFER = 10_000
 history: Deque[VitalPacket] = deque(maxlen=N_BUFFER)
 latest: Optional[VitalPacket] = None
 latest_server_ts: Optional[float] = None
-last_finger: Optional[int] = None  # New: last finger value
+last_finger: Optional[int] = None  # Last finger value
 
 second_buffer: List[VitalPacket] = []
 second_start_time: Optional[float] = None
@@ -83,11 +84,18 @@ async def upload_sensor_data(pkt: VitalPacket):
             second_start_time = time.time()
         second_buffer.append(pkt)
 
+        # Prepare payload
+        ws_payload = {
+            "received_at": latest_server_ts,
+            "packet": pkt.dict(),
+            "last_finger": last_finger
+        }
+
         # Broadcast to WebSocket clients
         disconnected = []
         for ws in connected_clients:
             try:
-                await ws.send_json(pkt.dict())
+                await ws.send_json(ws_payload)
             except Exception as e:
                 logger.warning(f"WebSocket disconnected: {e}")
                 disconnected.append(ws)
@@ -105,7 +113,6 @@ def get_latest():
     """Get the latest packet"""
     try:
         if latest is None:
-            logger.info("No latest packet available")
             return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
         return {
             "received_at": latest_server_ts,
@@ -149,7 +156,8 @@ async def websocket_endpoint(ws: WebSocket):
 
     try:
         while True:
-            await asyncio.sleep(1)
+            # Keep connection alive
+            await asyncio.sleep(10)
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
         connected_clients.remove(ws)
