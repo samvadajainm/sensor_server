@@ -74,7 +74,7 @@ connected_clients: List[WebSocket] = []
 # -------------------------------
 @app.post("/upload")
 async def upload_sensor_data(pkt: VitalPacket):
-    """Receive a single sensor packet"""
+    """Receive a single sensor packet and broadcast immediately"""
     global latest, latest_server_ts, second_buffer, second_start_time, last_finger
     global step_seconds_buffer, step_start_time
 
@@ -84,20 +84,14 @@ async def upload_sensor_data(pkt: VitalPacket):
         last_finger = pkt.finger
         history.append(pkt)
 
-        logger.info(f"Received packet: {pkt.deviceId} bpm={pkt.bpm} spo2={pkt.spo2_pct} finger={pkt.finger}")
+        logger.debug(f"Packet: {pkt.deviceId} bpm={pkt.bpm} spo2={pkt.spo2_pct} finger={pkt.finger}")
 
-        # Idle buffer
-        if second_start_time is None:
-            second_start_time = time.time()
-        second_buffer.append(pkt)
-
-        # Step buffer
-        if step_start_time is None:
-            step_start_time = time.time()
-        step_seconds_buffer.append(pkt)
-
-        # Broadcast to WebSocket clients
-        ws_payload = {"received_at": latest_server_ts, "packet": pkt.dict(), "last_finger": last_finger}
+        # ---------------- Real-time WebSocket broadcast ----------------
+        ws_payload = {
+            "received_at": latest_server_ts,
+            "packet": pkt.dict(),
+            "last_finger": last_finger
+        }
         disconnected = []
         for ws in connected_clients:
             try:
@@ -107,6 +101,15 @@ async def upload_sensor_data(pkt: VitalPacket):
                 disconnected.append(ws)
         for ws in disconnected:
             connected_clients.remove(ws)
+
+        # ---------------- Buffers for idle/step (1 Hz logic) ----------------
+        if second_start_time is None:
+            second_start_time = time.time()
+        second_buffer.append(pkt)
+
+        if step_start_time is None:
+            step_start_time = time.time()
+        step_seconds_buffer.append(pkt)
 
         return {"status": "ok", "count": len(history)}
 
@@ -118,54 +121,36 @@ async def upload_sensor_data(pkt: VitalPacket):
 @app.get("/data/latest")
 def get_latest():
     """Return the latest packet"""
-    try:
-        if latest is None:
-            return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
-        return {"received_at": latest_server_ts, "packet": latest.dict(), "last_finger": last_finger}
-    except Exception as e:
-        logger.error(f"Error in /data/latest: {e}")
-        return JSONResponse({"message": str(e)}, status_code=500)
+    if latest is None:
+        return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
+    return {"received_at": latest_server_ts, "packet": latest.dict(), "last_finger": last_finger}
 
 
 @app.get("/data/recent")
 def get_recent(limit: int = 100):
     """Return recent N packets"""
-    try:
-        if not history:
-            return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
-        limit = max(1, min(limit, len(history)))
-        return [p.dict() for p in list(history)[-limit:]]
-    except Exception as e:
-        logger.error(f"Error in /data/recent: {e}")
-        return JSONResponse({"message": str(e)}, status_code=500)
+    if not history:
+        return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
+    limit = max(1, min(limit, len(history)))
+    return [p.dict() for p in list(history)[-limit:]]
 
 
 @app.get("/health")
 def health():
-    try:
-        return {"ok": True, "buffer_size": len(history)}
-    except Exception as e:
-        logger.error(f"Error in /health: {e}")
-        return JSONResponse({"message": str(e)}, status_code=500)
+    return {"ok": True, "buffer_size": len(history)}
 
 
 @app.get("/data/steps")
 def get_steps():
     """Return today's step count"""
-    try:
-        return {"steps_today": steps_today}
-    except Exception as e:
-        return JSONResponse({"message": str(e)}, status_code=500)
+    return {"steps_today": steps_today}
 
 
 @app.get("/data/idle_time")
 def get_idle_time():
     """Return today's idle minutes"""
-    try:
-        idle_minutes_today = idle_seconds_today // 60
-        return {"idle_minutes": idle_minutes_today}
-    except Exception as e:
-        return JSONResponse({"message": str(e)}, status_code=500)
+    idle_minutes_today = idle_seconds_today // 60
+    return {"idle_minutes": idle_minutes_today}
 
 
 # -------------------------------
@@ -178,7 +163,7 @@ async def websocket_endpoint(ws: WebSocket):
     logger.info("WebSocket client connected")
     try:
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(10)  # keep connection alive
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
         connected_clients.remove(ws)
@@ -197,27 +182,22 @@ async def per_second_aggregator_task():
     logger.info("Per-second aggregator task started")
 
     while True:
-        try:
-            await asyncio.sleep(0.5)
-            if second_start_time is None or len(second_buffer) == 0:
-                continue
+        await asyncio.sleep(0.5)
+        if second_start_time is None or len(second_buffer) == 0:
+            continue
 
-            elapsed = time.time() - second_start_time
-            if elapsed >= 1.0:
-                avg_ax = mean([p.ax_g for p in second_buffer])
-                avg_ay = mean([p.ay_g for p in second_buffer])
-                avg_az = mean([p.az_g for p in second_buffer])
-                magnitude = math.sqrt(avg_ax**2 + avg_ay**2 + (avg_az - 1)**2)
+        elapsed = time.time() - second_start_time
+        if elapsed >= 1.0:
+            avg_ax = mean([p.ax_g for p in second_buffer])
+            avg_ay = mean([p.ay_g for p in second_buffer])
+            avg_az = mean([p.az_g for p in second_buffer])
+            magnitude = math.sqrt(avg_ax**2 + avg_ay**2 + (avg_az - 1)**2)
 
-                if magnitude < 0.55:
-                    idle_seconds_today += 1
+            if magnitude < 0.55:
+                idle_seconds_today += 1
 
-                second_buffer = []
-                second_start_time = time.time()
-                logger.debug(f"[Idle] magnitude={magnitude:.3f}, idle_seconds_today={idle_seconds_today}")
-
-        except Exception as e:
-            logger.error(f"Error in per-second aggregator: {e}")
+            second_buffer = []
+            second_start_time = time.time()
 
 
 # -------------------------------
@@ -228,27 +208,22 @@ async def per_second_step_task():
     logger.info("Per-second step task started")
 
     while True:
-        try:
-            await asyncio.sleep(0.5)
-            if step_start_time is None or len(step_seconds_buffer) == 0:
-                continue
+        await asyncio.sleep(0.5)
+        if step_start_time is None or len(step_seconds_buffer) == 0:
+            continue
 
-            elapsed = time.time() - step_start_time
-            if elapsed >= 1.0:
-                avg_ax = mean([p.ax_g for p in step_seconds_buffer])
-                avg_ay = mean([p.ay_g for p in step_seconds_buffer])
-                avg_az = mean([p.az_g for p in step_seconds_buffer])
-                magnitude = math.sqrt(avg_ax**2 + avg_ay**2 + (avg_az - 1)**2)
+        elapsed = time.time() - step_start_time
+        if elapsed >= 1.0:
+            avg_ax = mean([p.ax_g for p in step_seconds_buffer])
+            avg_ay = mean([p.ay_g for p in step_seconds_buffer])
+            avg_az = mean([p.az_g for p in step_seconds_buffer])
+            magnitude = math.sqrt(avg_ax**2 + avg_ay**2 + (avg_az - 1)**2)
 
-                if magnitude > 0.55:
-                    steps_today += 1
+            if magnitude > 0.55:
+                steps_today += 1
 
-                step_seconds_buffer = []
-                step_start_time = time.time()
-                logger.debug(f"[Steps] magnitude={magnitude:.3f}, steps_today={steps_today}")
-
-        except Exception as e:
-            logger.error(f"Error in per-second step task: {e}")
+            step_seconds_buffer = []
+            step_start_time = time.time()
 
 
 # -------------------------------
