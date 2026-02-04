@@ -21,7 +21,7 @@ app = FastAPI(title="Heart Rate & SpO2 Server")
 # Allow CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Change "*" to your frontend domain in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -54,11 +54,12 @@ latest: Optional[VitalPacket] = None
 latest_server_ts: Optional[float] = None
 last_finger: Optional[int] = None
 
+# Idle time
 second_buffer: List[VitalPacket] = []
 second_start_time: Optional[float] = None
 idle_seconds_today: int = 0
 
-# Step buffer & counter
+# Step detection
 step_seconds_buffer: List[VitalPacket] = []
 step_start_time: Optional[float] = None
 steps_today: int = 0
@@ -73,6 +74,7 @@ connected_clients: List[WebSocket] = []
 # -------------------------------
 @app.post("/upload")
 async def upload_sensor_data(pkt: VitalPacket):
+    """Receive a single sensor packet"""
     global latest, latest_server_ts, second_buffer, second_start_time, last_finger
     global step_seconds_buffer, step_start_time
 
@@ -84,7 +86,7 @@ async def upload_sensor_data(pkt: VitalPacket):
 
         logger.info(f"Received packet: {pkt.deviceId} bpm={pkt.bpm} spo2={pkt.spo2_pct} finger={pkt.finger}")
 
-        # Idle time buffer
+        # Idle buffer
         if second_start_time is None:
             second_start_time = time.time()
         second_buffer.append(pkt)
@@ -94,14 +96,8 @@ async def upload_sensor_data(pkt: VitalPacket):
             step_start_time = time.time()
         step_seconds_buffer.append(pkt)
 
-        # Prepare payload for WebSocket
-        ws_payload = {
-            "received_at": latest_server_ts,
-            "packet": pkt.dict(),
-            "last_finger": last_finger
-        }
-
         # Broadcast to WebSocket clients
+        ws_payload = {"received_at": latest_server_ts, "packet": pkt.dict(), "last_finger": last_finger}
         disconnected = []
         for ws in connected_clients:
             try:
@@ -121,14 +117,11 @@ async def upload_sensor_data(pkt: VitalPacket):
 
 @app.get("/data/latest")
 def get_latest():
+    """Return the latest packet"""
     try:
         if latest is None:
             return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
-        return {
-            "received_at": latest_server_ts,
-            "packet": latest.dict(),
-            "last_finger": last_finger
-        }
+        return {"received_at": latest_server_ts, "packet": latest.dict(), "last_finger": last_finger}
     except Exception as e:
         logger.error(f"Error in /data/latest: {e}")
         return JSONResponse({"message": str(e)}, status_code=500)
@@ -136,6 +129,7 @@ def get_latest():
 
 @app.get("/data/recent")
 def get_recent(limit: int = 100):
+    """Return recent N packets"""
     try:
         if not history:
             return JSONResponse({"message": "No data from sensor yet"}, status_code=404)
@@ -157,10 +151,22 @@ def health():
 
 @app.get("/data/steps")
 def get_steps():
+    """Return today's step count"""
     try:
         return {"steps_today": steps_today}
     except Exception as e:
         return JSONResponse({"message": str(e)}, status_code=500)
+
+
+@app.get("/data/idle_time")
+def get_idle_time():
+    """Return today's idle minutes"""
+    try:
+        idle_minutes_today = idle_seconds_today // 60
+        return {"idle_minutes": idle_minutes_today}
+    except Exception as e:
+        return JSONResponse({"message": str(e)}, status_code=500)
+
 
 # -------------------------------
 # WebSocket endpoint
@@ -170,7 +176,6 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     connected_clients.append(ws)
     logger.info("WebSocket client connected")
-
     try:
         while True:
             await asyncio.sleep(10)
@@ -182,6 +187,7 @@ async def websocket_endpoint(ws: WebSocket):
         if ws in connected_clients:
             connected_clients.remove(ws)
         await ws.close()
+
 
 # -------------------------------
 # Background per-second aggregator (idle time)
@@ -208,11 +214,11 @@ async def per_second_aggregator_task():
 
                 second_buffer = []
                 second_start_time = time.time()
-
                 logger.debug(f"[Idle] magnitude={magnitude:.3f}, idle_seconds_today={idle_seconds_today}")
 
         except Exception as e:
             logger.error(f"Error in per-second aggregator: {e}")
+
 
 # -------------------------------
 # Background per-second step detection
@@ -239,11 +245,11 @@ async def per_second_step_task():
 
                 step_seconds_buffer = []
                 step_start_time = time.time()
-
                 logger.debug(f"[Steps] magnitude={magnitude:.3f}, steps_today={steps_today}")
 
         except Exception as e:
             logger.error(f"Error in per-second step task: {e}")
+
 
 # -------------------------------
 # Startup
@@ -253,6 +259,7 @@ async def startup_event():
     asyncio.create_task(per_second_aggregator_task())
     asyncio.create_task(per_second_step_task())
     logger.info("Background per-second aggregator and step detection started")
+
 
 # -------------------------------
 # Run server
