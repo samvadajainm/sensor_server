@@ -27,6 +27,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+last_step_time: Optional[float] = None
+STEP_COOLDOWN_SEC = 0.7
+
 # Logging
 logger = logging.getLogger("sensor_server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -79,6 +82,7 @@ async def upload_sensor_data(pkt: VitalPacket):
     global step_seconds_buffer, step_start_time
 
     try:
+        pkt.bpm = pkt.bpm // 2
         latest = pkt
         latest_server_ts = time.time()
         last_finger = pkt.finger
@@ -188,13 +192,17 @@ async def per_second_aggregator_task():
 
         elapsed = time.time() - second_start_time
         if elapsed >= 1.0:
-            avg_ax = mean([p.ax_g for p in second_buffer])
-            avg_ay = mean([p.ay_g for p in second_buffer])
-            avg_az = mean([p.az_g for p in second_buffer])
-            magnitude = math.sqrt(avg_ax**2 + avg_ay**2 + (avg_az - 1)**2)
+            magnitudes = [
+                math.sqrt(p.ax_g**2 + p.ay_g**2 + p.az_g**2)
+                for p in second_buffer
+            ]
 
-            if magnitude < 0.55:
+            mean_mag = mean(magnitudes)
+            std_mag = math.sqrt(mean([(m - mean_mag) ** 2 for m in magnitudes]))
+
+            if std_mag < 0.02:
                 idle_seconds_today += 1
+
 
             second_buffer = []
             second_start_time = time.time()
@@ -214,13 +222,21 @@ async def per_second_step_task():
 
         elapsed = time.time() - step_start_time
         if elapsed >= 1.0:
-            avg_ax = mean([p.ax_g for p in step_seconds_buffer])
-            avg_ay = mean([p.ay_g for p in step_seconds_buffer])
-            avg_az = mean([p.az_g for p in step_seconds_buffer])
-            magnitude = math.sqrt(avg_ax**2 + avg_ay**2 + (avg_az - 1)**2)
+            magnitudes = [
+                math.sqrt(p.ax_g**2 + p.ay_g**2 + p.az_g**2)
+                for p in step_seconds_buffer
+            ]
 
-            if magnitude > 0.55:
-                steps_today += 1
+            mean_mag = mean(magnitudes)
+            std_mag = math.sqrt(mean([(m - mean_mag) ** 2 for m in magnitudes]))
+
+            now = time.time()
+
+            if std_mag > 0.04:
+                if last_step_time is None or (now - last_step_time) > STEP_COOLDOWN_SEC:
+                    steps_today += 1
+                    last_step_time = now
+
 
             step_seconds_buffer = []
             step_start_time = time.time()
